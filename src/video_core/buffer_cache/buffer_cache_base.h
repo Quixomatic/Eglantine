@@ -17,6 +17,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/container/unordered_map.h"
@@ -35,6 +36,7 @@
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/nx2.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -349,6 +351,10 @@ public:
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
 
+    /// The guest CPU reads [addr, addr + size) (pages its reads are tracked on): without
+    /// AsyncBufferDownloads, GPU writes there are still copied back at fences from now on.
+    void NoteCpuRead(DAddr addr, size_t size);
+
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(DAddr addr, size_t size);
 
@@ -375,6 +381,8 @@ public:
     Common::SpinRecursiveMutex mutex;
     Runtime& runtime;
     bool any_buffer_uploaded = false;
+    /// Indirectly read banks of native programs already uploaded this frame.
+    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
 private:
     template <typename Func>
@@ -568,7 +576,8 @@ private:
     /// dispatch, the fencing thread holding the buffer cache while it wrote them), while its CPU
     /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
     /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
-    /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
+    /// instead of ~5 and draw setup ~7% less. The titles that do read those pages back are listed
+    /// in Nx2NeedsBufferDownloads (nx2.h). EDEN_NX2_BUFFER_DOWNLOADS=0/1 overrides both.
     bool AsyncBufferDownloads() const {
         static const int forced = [] {
             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
@@ -577,7 +586,8 @@ private:
         if (forced >= 0) {
             return forced == 1;
         }
-        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
+        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
+               Tegra::Nx2NeedsBufferDownloads();
     }
 
     /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
@@ -606,6 +616,27 @@ private:
     Common::RangeSet<DAddr> read_trapped_ranges;
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+    /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
+    /// to them are still copied back at fences: Pokemon Pokopia builds its sky, fog and exposure
+    /// constants from values the GPU computes, and drew a black, flickering sky without them.
+    /// Copying every GPU-written range back instead (each written native storage binding is an
+    /// 8 MiB window) dropped it from 60 to about 42 frames a second.
+    Common::RangeSet<DAddr> cpu_read_ranges;
+
+    /// Queues a GPU write to [addr, addr + size): copied back at the next fence when downloads are
+    /// on or the range was read by the guest CPU (Preflushable); else only the parts the CPU is known
+    /// to read (cpu_read_ranges) are, and the rest traps the CPU's next read (ArmReadTraps).
+    void QueueDownload(DAddr addr, u64 size) {
+        if (DownloadsAtFence(addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(addr, size);
+            return;
+        }
+        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
+            uncommitted_gpu_modified_ranges.Add(start, end - start);
+        });
+        ArmReadTraps(addr, size);
+    }
+
 
     // Async Buffers
     Common::OverlapRangeSet<DAddr> async_downloads;

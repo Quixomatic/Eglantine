@@ -802,12 +802,13 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                        vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
     });
-    // Each decode ends with a submit to the host GPU. Measured here
-    // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=0 waits for the host GPU to go idle instead.
-    static const bool flush_only = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
-        return value == nullptr || value[0] != '0';
-    }();
+    // Each decode ends with the GPU thread waiting for the host GPU to go idle. Measured here
+    // (count and time per 5 s); EDEN_NX2_ASTC_FLUSH=1 submits without waiting instead, =0 always
+    // waits. Switch 2 textures only submit by default: Mario Kart World streams them while it
+    // draws, and each wait (20-50 ms) stalled the frame. The decoded image is used after the
+    // barrier above on the same queue either way, as the BCn transcode path does without waiting.
+    static const char* const flush_setting = std::getenv("EDEN_NX2_ASTC_FLUSH");
+    const bool flush_only = flush_setting != nullptr ? flush_setting[0] == '1' : info.native_tiling;
     if (!target.wait) {
         return;
     }

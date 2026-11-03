@@ -87,7 +87,8 @@ protected:
         }
     };
 
-    explicit ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory);
+    explicit ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory,
+                         bool native_tensor_full_by_default_ = false);
 
     /// @brief Update the hashes and information of shader stages
     /// @param unique_hashes Shader hashes to store into when a stage is enabled
@@ -104,6 +105,9 @@ protected:
 
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
+
+    Tegra::MaxwellDeviceMemoryManager& device_memory;
+    bool native_tensor_full_by_default = false;
 
 private:
     friend struct ShaderCacheTestAccess;
@@ -159,8 +163,6 @@ private:
     void RememberRejection(VAddr addr);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
-
-    Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     mutable std::mutex lookup_mutex;
     std::mutex invalidation_mutex;

@@ -226,6 +226,7 @@ inline bool DecodeNativeSwkbdConfig(std::span<const u8> data, SwkbdConfigCommon&
     std::memcpy(&native, data.data(), sizeof(native));
     common = {};
     config = {};
+    // Native configuration keeps the text prefix but relocates the flags and dictionary fields.
     std::memcpy(static_cast<void*>(&common), native.common_prefix.data(), native.common_prefix.size());
     common.enable_return_button = native.common_prefix[0x1B] != 0;
     common.use_utf8 = native.use_utf8;

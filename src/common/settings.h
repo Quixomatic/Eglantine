@@ -512,12 +512,10 @@ struct Values {
     SwitchableSetting<u8, false> bg_blue{
                                          linkage, 0, "bg_blue", Category::Renderer, Specialization::Default, true, true};
 
+    // Low by default: the accurate path (High) leaves the mission world black and the dialogue box
+    // flickering in Splatoon Raiders, and the same stale reads show up in other Switch 2 titles.
     SwitchableSetting<GpuAccuracy, true> gpu_accuracy{linkage,
-#ifdef __ANDROID__
                                                       GpuAccuracy::Low,
-#else
-                                                      GpuAccuracy::High,
-#endif
                                                       "gpu_accuracy",
                                                       Category::RendererAdvanced,
                                                       Specialization::Default,
@@ -606,6 +604,18 @@ struct Values {
 
     SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
                                                 Category::RendererAdvanced};
+
+    // Mario Kart World: keep the game in its own 30 fps mode (loader/nso.cpp).
+    SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
+    // Mario Kart World: the game's own dynamic frame rate, timed on the whole frame (nso.cpp),
+    // with presents paced to every vblank (nx2_gsv.h). Takes precedence over mkw_30fps.
+    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
+                                            Category::RendererAdvanced};
+    // Experimental: let the game run two frames ahead of the GPU thread at 30 fps (nx2_gsv.h).
+    SwitchableSetting<bool> mkw_smooth{linkage, false, "mkw_smooth", Category::RendererAdvanced};
+
+    // Donkey Kong Bananza: lock its frame rate controller to 30 fps (loader/nso.cpp).
+    SwitchableSetting<bool> dk_30fps{linkage, false, "dk_30fps", Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__

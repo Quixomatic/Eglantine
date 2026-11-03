@@ -25,6 +25,7 @@
 
 namespace VideoCommon {
 
+using Core::DEVICE_PAGEMASK;
 using Core::DEVICE_PAGESIZE;
 
 template <class P>
@@ -106,6 +107,7 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    native_indirect_uniforms_this_frame.clear();
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -305,11 +307,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
-        if (DownloadsAtFence(new_base_address, size)) {
-            uncommitted_gpu_modified_ranges.Add(new_base_address, size);
-        } else {
-            ArmReadTraps(new_base_address, size);
-        }
+        QueueDownload(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
     // This subtraction in this order is important for overlapping copies.
@@ -820,6 +818,26 @@ bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
 }
 
 template <class P>
+void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
+    if (AsyncBufferDownloads()) {
+        return;
+    }
+    size_t covered = 0;
+    cpu_read_ranges.ForEachInRange(addr, size,
+                                   [&](DAddr start, DAddr end) { covered += end - start; });
+    if (covered >= size) {
+        return;
+    }
+    cpu_read_ranges.Add(addr, size);
+    if (Nx2Profile::Enabled()) {
+        static u64 noted{};
+        if ((++noted & 255) == 1) {
+            LOG_INFO(HW_GPU, "CPU-read buffer pages noted: {} (latest {:#x})", noted, addr);
+        }
+    }
+}
+
+template <class P>
 bool BufferCache<P>::IsRegionRegistered(DAddr addr, size_t size) {
     const DAddr end_addr = addr + size;
     const u64 page_end = Common::DivCeil(end_addr, CACHING_PAGESIZE);
@@ -1103,6 +1121,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             return alignment > 1 && (offset % alignment) != 0;
         }
     }();
+    // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
+    // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
+    // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
+        size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
+        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
+        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        // The bank size is only an upper limit: stop at the end of the mapped memory.
+        u64 mapped_size = 0;
+        while (mapped_size < size &&
+               device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+            mapped_size += DEVICE_PAGESIZE - ((device_addr + mapped_size) & DEVICE_PAGEMASK);
+        }
+        if (mapped_size != 0) {
+            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
+        }
+    }
     const bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
             && !memory_tracker.IsRegionGpuModified(device_addr, size));
@@ -1718,11 +1753,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
-    if (DownloadsAtFence(device_addr, size)) {
-        uncommitted_gpu_modified_ranges.Add(device_addr, size);
-    } else {
-        ArmReadTraps(device_addr, size);
-    }
+    QueueDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);

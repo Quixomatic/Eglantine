@@ -20,6 +20,23 @@ namespace Tegra {
 // Ampere classes and the Turing+ macro ISA, which Eden's Maxwell engines don't implement.
 inline std::atomic<bool> g_nx2_ampere{false};
 
+// The running title, for the few places that must behave differently per game.
+inline std::atomic<u64> g_nx2_program_id{0};
+
+// Titles whose guest side reads GPU-written buffer data through a path the buffer cache does not
+// see, so their buffers must be copied back to guest memory at every fence
+// (BufferCache::AsyncBufferDownloads, EDEN_NX2_BUFFER_DOWNLOADS). 0400A3A01EE4C000 is Pokemon
+// Pokopia: with the copy-back off its sky is black or flickers. Open work: find what reads it,
+// then the list goes.
+inline bool Nx2NeedsBufferDownloads() {
+    switch (g_nx2_program_id.load(std::memory_order_relaxed)) {
+    case 0x0400A3A01EE4C000ULL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
 // runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
 // without a flush they are stale and the draws behind them (trees) go missing. The bits never
@@ -136,6 +153,9 @@ inline std::recursive_mutex g_nx2_sparse_backing_mutex;
 inline Nx2SparseBackingHandler g_nx2_sparse_backing;
 inline std::atomic<u64> g_nx2_sparse_low{~u64{0}};
 inline std::atomic<u64> g_nx2_sparse_high{0};
+/// Set by the renderer before a game runs: false when the host driver can't use the sparse images
+/// lazily backed regions lead to (AMD's Windows driver divides by zero in amdvlk64.dll).
+inline std::atomic<bool> g_nx2_sparse_lazy_supported{true};
 
 inline void Nx2SetSparseBacking(Nx2SparseBackingHandler handler) {
     std::scoped_lock lk{g_nx2_sparse_backing_mutex};

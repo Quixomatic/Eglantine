@@ -16,9 +16,11 @@ CircularBufferSinkInfo::CircularBufferSinkInfo() {
 }
 
 void CircularBufferSinkInfo::CleanUp() {
-    // Only device sinks own an upsampler. This sink's state is a CircularBufferState, whose
-    // first words are buffer positions: reading them as DeviceState::upsampler_info freed a
-    // garbage pointer when a game changed or removed its circular buffer sink.
+    // Circular buffer sinks own no upsampler; their state is a CircularBufferState, whose position
+    // counters would read as a DeviceState::upsampler_info pointer.
+    state.fill(0);
+    reinterpret_cast<CircularBufferState*>(state.data())->address_info.Setup(0, 0);
+
     parameter.fill(0);
     type = Type::Invalid;
 }

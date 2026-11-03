@@ -7,6 +7,7 @@
 #include "audio_core/audio_core.h"
 #include "common/string_util.h"
 #include "core/hle/service/audio/audio_device.h"
+#include "core/hle/service/audio/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 
 namespace Service::Audio {
@@ -16,9 +17,7 @@ IAudioDevice::IAudioDevice(Core::System& system_, u64 applet_resource_user_id, u
                            u32 device_num)
     : ServiceFramework{system_, "IAudioDevice"}, service_context{system_, "IAudioDevice"},
       impl{std::make_unique<AudioDevice>(system_, applet_resource_user_id, revision)},
-      event{service_context.CreateEvent(fmt::format("IAudioDeviceEvent-{}", device_num))},
-      notification_event{service_context.CreateEvent(
-          fmt::format("IAudioDeviceNotification-{}", device_num))} {
+      event{service_context.CreateEvent(fmt::format("IAudioDeviceEvent-{}", device_num))} {
     static const FunctionInfo functions[] = {
         {0, D<&IAudioDevice::ListAudioDeviceName>, "ListAudioDeviceName"},
         {1, D<&IAudioDevice::SetAudioDeviceOutputVolume>, "SetAudioDeviceOutputVolume"},
@@ -35,10 +34,10 @@ IAudioDevice::IAudioDevice(Core::System& system_, u64 applet_resource_user_id, u
         {12, D<&IAudioDevice::QueryAudioDeviceOutputEvent>, "QueryAudioDeviceOutputEvent"},
         {13, D<&IAudioDevice::GetActiveAudioDeviceName>, "GetActiveAudioOutputDeviceName"},
         {14, D<&IAudioDevice::ListAudioOutputDeviceName>, "ListAudioOutputDeviceName"},
-        {15, D<&IAudioDevice::AcquireAudioDeviceNotification>, "AcquireAudioInputDeviceNotification"}, //17.0.0+
-        {16, D<&IAudioDevice::ReleaseAudioDeviceNotification>, "ReleaseAudioInputDeviceNotification"}, //17.0.0+
-        {17, D<&IAudioDevice::AcquireAudioDeviceNotification>, "AcquireAudioOutputDeviceNotification"}, //17.0.0+
-        {18, D<&IAudioDevice::ReleaseAudioDeviceNotification>, "ReleaseAudioOutputDeviceNotification"}, //17.0.0+
+        {15, nullptr, "AcquireAudioInputDeviceNotification"}, //17.0.0+
+        {16, nullptr, "ReleaseAudioInputDeviceNotification"}, //17.0.0+
+        {17, D<&IAudioDevice::AcquireAudioOutputDeviceNotification>, "AcquireAudioOutputDeviceNotification"}, //17.0.0+
+        {18, D<&IAudioDevice::ReleaseAudioOutputDeviceNotification>, "ReleaseAudioOutputDeviceNotification"}, //17.0.0+
         {19, D<&IAudioDevice::SetAudioDeviceOutputVolumeAutoTuneEnabled>, "SetAudioDeviceOutputVolumeAutoTuneEnabled"}, //18.0.0+
         {20, D<&IAudioDevice::IsAudioDeviceOutputVolumeAutoTuneEnabled>, "IsAudioDeviceOutputVolumeAutoTuneEnabled"}, //18.0.0+
         {21, &IAudioDevice::StubReplyZeroed, "IsActiveOutputDeviceEstimatedLowLatency"} //21.0.0+
@@ -49,7 +48,9 @@ IAudioDevice::IAudioDevice(Core::System& system_, u64 applet_resource_user_id, u
 }
 
 IAudioDevice::~IAudioDevice() {
-    service_context.CloseEvent(notification_event);
+    for (const auto& [id, notification] : output_notifications) {
+        service_context.CloseEvent(notification);
+    }
     service_context.CloseEvent(event);
 }
 
@@ -149,18 +150,21 @@ Result IAudioDevice::QueryAudioDeviceOutputEvent(OutCopyHandle<Kernel::KReadable
     R_SUCCEED();
 }
 
-// 15/17(u64): an event that fires when the input/output device set changes, which it never
-// does here. Switch 2 titles (Kirby Air Riders, Switch Sports) ask for it; the auto stub
-// replied without a handle.
-Result IAudioDevice::AcquireAudioDeviceNotification(OutCopyHandle<Kernel::KReadableEvent> out_event,
-                                                    u64 unknown) {
-    LOG_DEBUG(Service_Audio, "called, unknown={:#x}", unknown);
-    *out_event = &notification_event->GetReadableEvent();
+Result IAudioDevice::AcquireAudioOutputDeviceNotification(
+    OutCopyHandle<Kernel::KReadableEvent> out_event, u64 notification_id) {
+    R_UNLESS(!output_notifications.contains(notification_id), ResultInvalidArgument);
+    auto* notification = service_context.CreateEvent("AudioOutputDeviceNotification");
+    R_UNLESS(notification, ResultOperationFailed);
+    output_notifications.emplace(notification_id, notification);
+    *out_event = &notification->GetReadableEvent();
     R_SUCCEED();
 }
 
-Result IAudioDevice::ReleaseAudioDeviceNotification(u64 unknown) {
-    LOG_DEBUG(Service_Audio, "called, unknown={:#x}", unknown);
+Result IAudioDevice::ReleaseAudioOutputDeviceNotification(u64 notification_id) {
+    const auto it = output_notifications.find(notification_id);
+    R_UNLESS(it != output_notifications.end(), ResultNotFound);
+    service_context.CloseEvent(it->second);
+    output_notifications.erase(it);
     R_SUCCEED();
 }
 
