@@ -456,6 +456,13 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        const auto& ds = maxwell3d->draw_manager.draw_state;
+        const u32 count = is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count;
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::Draws, 1);
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::EmptyDraws,
+                                     count == 0 || instance_count == 0 ? 1 : 0);
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);

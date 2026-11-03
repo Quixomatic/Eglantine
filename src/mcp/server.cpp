@@ -256,7 +256,7 @@ Server::Server(Core::System& system_, Host& host_, ServerConfig config_)
             return std::string{
                 "Enable gpu_profile with window_ms 3000 and fresh true. Report fps, the top zones "
                 "on the GPU front thread ('GPU thread') and back thread ('GPU back thread'), split "
-                "drains per second, draws per second and ms per draw, then list_threads twice 5 s "
+                "drains by site, draws per second and ms per draw, then list_threads twice 5 s "
                 "apart to get guest CPU time per thread. Say whether the bottleneck is the GPU "
                 "front, the back, the guest CPU, or waiting between them, with numbers."};
         },

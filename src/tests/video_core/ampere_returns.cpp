@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/maxwell/decode.h"
 
 namespace {
 using Shader::Ampere::Instruction;
@@ -74,5 +75,26 @@ TEST_CASE("Ampere callees reject a wide multiply over the link", "[video_core][a
     REQUIRE(!static_cast<bool>(lowered));
     REQUIRE(lowered.error == "native callee overwrites link register");
     REQUIRE(lowered.error_offset == 0x30);
+}
+
+TEST_CASE("Ampere half matrix multiply accumulates in f32 by default", "[video_core][ampere]") {
+    const std::array<Instruction, 2> code{{
+        {{0x1008723c, 0x20, 0x00000828, 0}},
+        {{0x0000794d, 0, 0x03800000, 0}},
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    REQUIRE(static_cast<bool>(lowered));
+
+    // K=16: 8 pairs x 2 rows x 2 halves x 2 columns of f32 FFMA, and no f16 HFMA2 chain (which
+    // overflowed to inf/NaN in Donkey Kong Bananza's upscaler).
+    u32 hfma2s{};
+    u32 ffmas{};
+    for (const u64 instruction : lowered.instructions) {
+        const auto opcode = Shader::Maxwell::Decode(instruction);
+        hfma2s += opcode == Shader::Maxwell::Opcode::HFMA2_reg;
+        ffmas += opcode == Shader::Maxwell::Opcode::FFMA_reg;
+    }
+    REQUIRE(hfma2s == 0);
+    REQUIRE(ffmas == 64);
 }
 } // namespace

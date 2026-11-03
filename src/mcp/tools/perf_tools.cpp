@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // GPU profiling as data: toggles the NX2 GPU-thread profiler at runtime and returns each
-// thread's last report (zones, counters) as JSON.
+// thread's last report (zones, counters, split drains by site) as JSON.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <map>
-#include <string_view>
 #include <thread>
 
 #ifdef _WIN32
@@ -56,18 +55,19 @@ json SnapshotJson(const Profile::Snapshot& snap, u64 now, size_t top) {
             counters[name] = value;
         }
     }
-    // Split GPU thread: how often the front waited for the back (the "split drain" zone).
+    // Split GPU thread: why (and how often) the front waited for the back.
+    json drains = json::object();
     double total_drains = 0.0;
-    for (const auto& z : snap.zones) {
-        if (std::string_view{z.name} == "split drain") {
-            total_drains = z.calls;
-        }
+    for (const auto& [name, value] : snap.drains) {
+        drains[name] = value;
+        total_drains += value;
     }
     return json{{"thread", snap.thread},
                 {"age_ms", static_cast<double>(now - snap.when_ns) / 1e6},
                 {"window_ms", static_cast<double>(snap.window_ns) / 1e6},
                 {"zones", std::move(zone_list)},
                 {"counters_per_s", std::move(counters)},
+                {"split_drains_per_s", std::move(drains)},
                 {"split_drains_total_per_s", total_drains}};
 }
 
@@ -416,8 +416,8 @@ void RegisterPerfTools(ToolRegistry& registry) {
         .title = "GPU thread profile",
         .description =
             "Where the GPU threads spend their time, as data: per thread, exclusive ms/s and "
-            "calls/s per zone (draw, macro, update buffers, split drain...), counters (register "
-            "writes, downloads, semaphore acquires) and split drains, plus fps. enable turns the "
+            "calls/s per zone (draw, macro, update buffers, split drain...), counters (draws, "
+            "register writes, downloads) and split drains by site, plus fps. enable turns the "
             "profiler on/off live; window_ms sets the report window (default 10000); fresh waits "
             "for a report covering only time after the call (default when just enabled).",
         .input_schema = {{"type", "object"},

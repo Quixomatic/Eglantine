@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.1] - 2026-11-03
+
+Ports the private fork's own fixes: Donkey Kong Bananza no longer renders purple, and the NX2 GPU
+profiler says why the split GPU threads wait.
+
+### Fixed
+- **HMMA (tensor) is emulated by default with f32 accumulation.** Each product is summed in f32 and
+  rounded to f16 once per K=8 block, as the tensor cores do; the old f16 HFMA2 chain overflowed to
+  inf/NaN in DK Bananza's upscaler (purple screen). HMMA.1688 is handled too. `EDEN_NX2_TENSOR=stub`
+  keeps the diagnostic D = C and `EDEN_NX2_TENSOR=off` rejects HMMA
+  (`shader_recompiler/frontend/ampere/lower_to_maxwell.h`, test in `ampere_returns.cpp`).
+
+### Added
+- **Split drains by site and draw counters in the NX2 profiler.** `EDEN_NX2_GPU_PROFILE` and the MCP's
+  `gpu_profile` / `perf_sample` report why the front waited for the back (command sync, GPU-written
+  params, front init, MME DMA read, puller, ring full, writer wait) and draws / empty draws per second.
+
 ## [0.1.0] - 2026-11-03
 
 The first release of this fork: upstream Eglantine `nx2` (3779433f61) with the built-in MCP server, and a
