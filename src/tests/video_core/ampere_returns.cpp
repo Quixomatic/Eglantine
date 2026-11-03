@@ -50,24 +50,6 @@ TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere
     REQUIRE(lowered.error_offset == 0x30);
 }
 
-TEST_CASE("Ampere half matrix multiply lowers to the compact fallback when requested",
-          "[video_core][ampere]") {
-    const std::array<Instruction, 2> code{{
-        {{0x1008723c, 0x20, 0x00000828, 0}},
-        {{0x0000794d, 0, 0x03800000, 0}},
-    }};
-    const auto lowered = LowerToMaxwell(code, "full");
-    REQUIRE(static_cast<bool>(lowered));
-
-    u32 hfma2s{};
-    for (const u64 instruction : lowered.instructions) {
-        if (Shader::Maxwell::Decode(instruction) == Shader::Maxwell::Opcode::HFMA2_reg) {
-            ++hfma2s;
-        }
-    }
-    REQUIRE(hfma2s == 32);
-}
-
 TEST_CASE("Ampere callees can compare into predicates with an R0 link", "[video_core][ampere]") {
     // ISETP's zero destination field is not a write to R0.
     const std::array<Instruction, 5> code{{

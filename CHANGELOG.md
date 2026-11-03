@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.2] - 2026-11-03
+
+Brings in the PokeDinner fork (Franseven/PokeDinner-a-Eglantine-Fork `master` 216b5034c6, 171 commits).
+Donkey Kong Bananza's ground renders solid again, and the to_gameplay route replays end to end.
+
+### Added
+- **PokeDinner's fixes and features**, among them: sparse terrain arrays bound layer by layer with memory
+  only where the GPU writes (DK's see-through ground), AMD sparse-region and RDNA fixes, Switch 2 ASTC
+  limits and partial re-uploads, texture-cache format mappings (X8Z24, G8R24), TXQ from any descriptor
+  buffer, NVN mapping modify, shader-reuse and pipeline work, the DK Bananza 30 fps lock checkbox, Mario
+  Kart World 30 fps / dynamic fps modes and a remembered recommended-settings prompt.
+
+### Changed
+- **HMMA uses PokeDinner's f32 lowering** (equivalent to 0.1.1's, plus a predicate check).
+  `EDEN_NX2_TENSOR` wins, otherwise the caller's mode, and unset still emulates.
+
+### Fixed
+- Build with warnings as errors: a local in the HMMA lowering shadowed a parameter (MSVC C4457), and the
+  AArch32 fatal-context copy tripped GCC's `-Wclass-memaccess` (it broke the Linux release builds).
+- Removed PokeDinner's stale HMMA test that still expected the old f16 HFMA2 chain.
+
+### Internal
+- Merge conflicts: HMMA and the F2I / guarded-uniform tails of `lower_to_maxwell.h` (both sides'
+  conversion modes and checks kept), the MKW prompt (PokeDinner's), `-d`/`-i` parsing and the video
+  decoder EOS handling (dev's).
+- Verified on DK: route `to_gameplay` completes (72 s from boot), `bench_spawn` 13.0 / 39.0 fps.
+
 ## [0.1.1] - 2026-11-03
 
 Ports the private fork's own fixes: Donkey Kong Bananza no longer renders purple, and the NX2 GPU

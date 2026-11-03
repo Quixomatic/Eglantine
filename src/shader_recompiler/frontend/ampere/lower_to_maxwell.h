@@ -1317,9 +1317,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // scene yellow; the two disagree by more than f16 rounding because the sums sit near the
             // top of the f16 range. Rejecting the program is the escape hatch: a pass that never runs
             // leaves DK Bananza's scene flat lilac.
+            // EDEN_NX2_TENSOR wins; otherwise the caller's mode; unset everywhere emulates.
             static const char* const mode_env = std::getenv("EDEN_NX2_TENSOR");
-            const std::string_view tensor_mode{mode_env ? mode_env : ""};
-            if (tensor_mode == "off" || tensor_mode == "0")
+            const std::string_view mma_mode{mode_env ? std::string_view{mode_env} : tensor_mode};
+            if (mma_mode == "off" || mma_mode == "0")
                 return fail(index, "native matrix multiply (EDEN_NX2_TENSOR=off)");
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
             const u32 form = insn.words[2] & ~0xffU;
@@ -1329,7 +1330,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (dest & 1) || dest + 2 > 246 || (a & (a_count - 1)) || a + a_count > 246 ||
                 (b & (b_count - 1)) || b + b_count > 246 || (c != 255 && ((c & 1) || c + 2 > 246)))
                 return fail(index, "native half matrix multiply mode");
-            if (tensor_mode == "stub") {
+            if (mma_mode == "stub") {
                 for (u32 row = 0; row < 2; ++row) {
                     if (c == 255) mov_imm(static_cast<u32>(dest) + row, 0);
                     else if (c != dest) emit(0x5c98000000000000ULL | predicate | (dest + row) | (u64{15} << 39) | (u64{c + row} << 20));
