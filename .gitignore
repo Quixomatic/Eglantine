@@ -67,3 +67,7 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+
+# Fork tooling: only the shared skills are tracked under .claude
+.claude/*
+!.claude/skills/

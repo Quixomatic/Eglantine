@@ -1,30 +1,21 @@
 name: release-binaries
 
+# This fork releases from semver tags only (vX.Y.Z, or vX.Y.Z-label for a prerelease) on commits of
+# the `release` branch: `nx2` mirrors upstream, `dev` is the work branch, `release` gets `dev`
+# merged in, and a tag on it builds every platform and publishes a GitHub Release. The release
+# body is .release/patch-notes/<tag>.md, else the CHANGELOG.md section, then the download tables.
+# A manual run builds the matrix without publishing unless it is started on a tag.
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: Publish the binaries as a GitHub release
+        description: Publish a GitHub release (only when run on a vX.Y.Z tag)
         type: boolean
-        default: true
+        default: false
   push:
-    branches:
-      - nx2
-      - nx2-experimental
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # YUZU_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - ".github/workflows/release-binaries.yml"
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
 
 permissions:
   contents: read
@@ -42,8 +33,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Tags must point at a commit of the release branch, so a tag pushed on dev by mistake does not
+  # publish a release.
+  check-tag:
+    name: Check the tag is on release
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tagged commit must be on the release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin release
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA::7}) is not on the release branch."
+            exit 1
+          fi
+
   build:
     name: ${{ matrix.platform }} binary
+    needs: check-tag
+    # Runs after the check on tags, and on its own for manual runs (the check is skipped there).
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ${{ matrix.runner }}
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -567,11 +581,20 @@ jobs:
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    # Only tags publish: a push of one, or a manual run on one with publish_release ticked.
+    if: >-
+      ${{ !failure() && !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name == 'push' || inputs.publish_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            CHANGELOG.md
+            .release
+
       - name: Download binaries
         uses: actions/download-artifact@v7
         with:
@@ -609,11 +632,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="build-${GITHUB_RUN_NUMBER}"
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
-          cat > notes.md <<EOF
-          Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+          # Release body: the curated notes for this tag, else its CHANGELOG.md section, else a
+          # pointer to the changelog. The download tables follow.
+          if [ -f ".release/patch-notes/${tag}.md" ]; then
+            cp ".release/patch-notes/${tag}.md" notes.md
+          else
+            awk -v ver="## [${version}]" '
+              index($0, ver) == 1 { grab = 1; next }
+              grab && /^## \[/ { exit }
+              grab { print }
+            ' CHANGELOG.md > notes.md || true
+          fi
+          sed -i '/./,$!d' notes.md || true
+          if [ ! -s notes.md ]; then
+            echo "Release ${tag}. See CHANGELOG.md for the changes." > notes.md
+          fi
+
+          cat >> notes.md <<EOF
+
+          ---
+
+          Built from \`${tag}\` at ${GITHUB_SHA}.
 
           ## Linux
 
@@ -642,11 +685,16 @@ jobs:
           The PGO builds are the same programs compiled with profile-guided optimization (clang plus Eden's profile); prefer them when your CPU supports it.
           EOF
 
+          # A label after the version (v1.2.3-beta.1) marks a prerelease.
+          prerelease=()
+          if [[ "${version}" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
           gh release create "${tag}" dist/* \
             --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --prerelease \
-            --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --verify-tag \
+            "${prerelease[@]}" \
+            --title "Eglantine ${tag}" \
             --notes-file notes.md
 
       - name: Ping Discord
@@ -654,7 +702,12 @@ jobs:
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/build-${GITHUB_RUN_NUMBER}"
+          # Skipped where no webhook is configured (e.g. this fork).
+          if [ -z "${WEBHOOK}" ]; then
+            echo "No DISCORD_WEBHOOK_URL secret; skipping."
+            exit 0
+          fi
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}"
           MSG=$(printf '## <@&1566184315178713190> Eglantine %s build %s (%s)\n%s' \
             "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER" "${GITHUB_SHA::7}" "$URL")
           jq -n --arg content "$MSG" \
