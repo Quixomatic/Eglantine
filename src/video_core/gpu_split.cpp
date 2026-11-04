@@ -137,6 +137,7 @@ void GpuSplit::Stop() {
     // wrap at a time and never reached the old write position (the next game's first GPU work
     // never ran, it waited on its syncpoint forever), and the engines it held were freed.
     ring.reset();
+    open_run = nullptr;
     write_position = 0;
     last_writer_position = 0;
     published_local = 0;
@@ -185,6 +186,8 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    // The back may read anything published: no more appends to the open run.
+    open_run = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -324,6 +327,19 @@ size_t GpuSplit::Execute(const u64* entry) {
         engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
         return data + (amount + 1) / 2;
+    }
+    case Kind::Run: {
+        const size_t count = static_cast<size_t>((head >> 8) & 0xffffff);
+        auto* const engine = back_engine;
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        // Only Method entries feed the sink: one check covers the run.
+        engine->ConsumeSink(*system);
+        for (size_t i = 1; i <= count; ++i) {
+            const u64 word = entry[i];
+            engine->CallMethod(*system, static_cast<u32>((word >> 8) & 0xffff),
+                               static_cast<u32>(word >> 32), true);
+        }
+        return 1 + count;
     }
     case Kind::Call: {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);

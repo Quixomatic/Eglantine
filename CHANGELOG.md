@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.14] - 2026-11-04
+
+Macro register writes reach the GPU back thread in batches: Donkey Kong Bananza's open map ~19 ->
+21.4 fps (the back now prepares ~146k draws a second instead of ~128k), rendering unchanged.
+
+### Changed
+- **Consecutive macro writes to one engine travel as one `Run` entry** in the GPU split's ring
+  instead of one entry each. The back loops over them with one method-sink check and one profiler
+  scope, skipping the per-entry dispatch (~2.5-3 million writes a second in DK): the back's method
+  zone went from 175 to 124 ms/s and its unattributed time from 138 to 67 ms/s. A run stays open
+  only until something else is written or the ring is published, so the order is unchanged.
+
+### Added
+- Profiler counters `uniform_reused` / `uniform_copied`: small uniform binds that rebound the
+  previous allocation versus copied new bytes (DK: ~76% reused, ~6 uniform binds per draw).
+
 ## [0.1.13] - 2026-11-04
 
 ### Internal
