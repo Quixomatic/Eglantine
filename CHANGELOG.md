@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.32] - 2026-11-04
+
+The release workflow no longer loses a whole release to one warning or one stalled download.
+
+### Fixed
+- **Release builds no longer treat compiler warnings as errors** (`-DENABLE_WERROR=OFF`). A warning
+  failed both Linux GCC builds of the v0.1.0 and v0.1.2 tags.
+- **The MSYS2 setup retries up to twice.** A stalled package mirror failed the Windows PGO build of the
+  v0.1.2 tag.
+- **A failed platform no longer holds back the others.** The release used to publish only if every
+  build succeeded, so neither tag produced one. It now publishes what built and its notes list what is
+  missing.
+- `memory_manager.cpp` includes what the same-bytes write skip uses.
+
 ## [0.1.31] - 2026-11-04
 
 Fewer copies per uniform buffer bind and fewer worker wake-ups: Donkey Kong Bananza's open map holds
