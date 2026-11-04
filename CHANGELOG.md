@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.5] - 2026-11-03
+
+Fixes the Linux release builds, which the v0.1.2 tag run failed.
+
+### Fixed
+- An unused variable in the partial texture re-upload (`texture_cache/util.cpp`) failed GCC's
+  `-Werror=unused-but-set-variable` in both Linux GCC builds.
+
 ## [0.1.4] - 2026-11-03
 
 Brings in upstream `nx2` 8615d8d53e (210 commits). Donkey Kong Bananza still renders correctly and
