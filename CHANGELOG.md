@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.21] - 2026-11-04
+
+Draws that hit the texture binding cache push their image descriptors from the cache: Donkey Kong
+Bananza's open map 1% low 21.7 -> 22.4 fps (same build, switch off and on), rendering unchanged.
+
+### Changed
+- **The binding cache also keeps the descriptor entries its views and samplers produced** (image
+  view and sampler handles, and whether each texture is rescaled) and pushes them again on a hit,
+  skipping the per-texture view, sampler and rescaling lookups of `PushImageDescriptors`. The
+  entries change only with what already invalidates the cache (image deletion, rescaling).
+  `EDEN_NX2_BINDCACHE_ENTRIES=0` pushes them the full way.
+
 ## [0.1.20] - 2026-11-04
 
 Inline writes stop taking the query cache's lock for pages without queries: Donkey Kong Bananza's

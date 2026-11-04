@@ -642,8 +642,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             tbc.slots = std::move(recorded_slots);
             tbc.views.assign(views.begin(), views.end());
             tbc.samplers.assign(samplers.begin(), samplers.end());
+            tbc.entries_valid = false;
         }
     }
+    // Descriptor entries: pushed again from the cache on a hit, recorded on the first push of a
+    // cached resolution (EDEN_NX2_BINDCACHE_ENTRIES=0 always pushes them the full way).
+    static const bool entries_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BINDCACHE_ENTRIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool reuse_entries = entries_enabled && texture_hit && tbc.entries_valid;
+    const bool record_entries = entries_enabled && texture_cache_on && !reuse_entries;
+    if (record_entries) {
+        tbc.image_entries.clear();
+        tbc.rescaled.clear();
+    }
+    size_t entry_pos = 0;
+    size_t rescaled_pos = 0;
     // Profiling: how often a draw's bindings repeat the previous draw's (for a fast path).
     if (Profile::Enabled()) [[unlikely]] {
         static u64 last_textures{}, last_buffers{};
@@ -776,8 +791,45 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+            // Cached pipelines have plain sampled textures only (texture_cacheable_spec).
+            const Shader::Info& stage_info{stage_infos[stage]};
+            if (reuse_entries) {
+                for (const auto& desc : stage_info.texture_descriptors) {
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        const auto& [image_view, sampler] = tbc.image_entries[entry_pos++];
+                        guest_descriptor_queue.AddSampledImage(image_view, sampler);
+                    }
+                    rescaling.PushTexture(tbc.rescaled[rescaled_pos++] != 0);
+                    views_it += desc.count;
+                    samplers_it += desc.count;
+                }
+            } else if (record_entries) {
+                for (const auto& desc : stage_info.texture_descriptors) {
+                    bool is_rescaled{};
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        ImageView& image_view{texture_cache.GetImageView((views_it++)->id)};
+                        VkImageView vk_image_view{image_view.Handle(desc.type)};
+                        if (vk_image_view == VK_NULL_HANDLE) {
+                            const VkImageView null_image_view{
+                                texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)
+                                    .Handle(desc.type)};
+                            if (null_image_view != VK_NULL_HANDLE) {
+                                vk_image_view = null_image_view;
+                            }
+                        }
+                        Sampler& sampler{texture_cache.GetSampler(*(samplers_it++))};
+                        const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+                        guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
+                        tbc.image_entries.emplace_back(vk_image_view, vk_sampler);
+                        is_rescaled |= texture_cache.IsRescaling(image_view);
+                    }
+                    rescaling.PushTexture(is_rescaled);
+                    tbc.rescaled.push_back(is_rescaled ? 1 : 0);
+                }
+            } else {
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_info, rescaling,
+                                     samplers_it, views_it);
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -803,6 +855,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
+    }
+    if (record_entries) {
+        tbc.entries_valid = true;
     }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();

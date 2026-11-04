@@ -230,6 +230,12 @@ private:
         std::vector<TextureSlotCache> slots;
         std::vector<VideoCommon::ImageViewInOut> views;
         std::vector<VideoCommon::SamplerId> samplers;
+        /// The descriptor entries these views and samplers produced (image view and sampler
+        /// handles, and per texture descriptor whether it is rescaled), pushed again on a hit:
+        /// they change only with what invalidates the cache (deletion, rescaling).
+        bool entries_valid{};
+        std::vector<std::pair<VkImageView, VkSampler>> image_entries;
+        std::vector<u8> rescaled;
     };
     TextureBindingCache texture_binding_cache;
     /// -1 not computed, 0 no, 1 yes: only plain sampled textures with constant buffer handles.
