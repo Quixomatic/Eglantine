@@ -143,11 +143,14 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "pbflush", "command sync", "gpu-written params", "3d front init", "mme dma read",
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
+/// Number of Counter values (the enum is below; checked there).
+inline constexpr size_t CounterCount = 15;
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 10> counters{}; ///< See Counter
+    std::array<u64, CounterCount> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
@@ -200,8 +203,14 @@ enum class Counter : u32 {
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
     Draws,          ///< Direct draws reaching the rasterizer
     EmptyDraws,     ///< Of Draws: zero vertices/indices or zero instances
+    ListCopied,     ///< GPU-written command list entries read from their host copy
+    ListSynced,     ///< ...read from guest memory (flushed, no GPU write since)
+    ListNoPage,     ///< ...not readable cheaply: the page has no copy entry yet
+    ListDrawWritten, ///< ...not readable cheaply: draws wrote the page (copies only follow compute/copies)
+    ListStale,      ///< ...not readable cheaply: written again since its copy, or outside it
     Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
 
 /// Counts a drain that had to wait (the back still had work).
 inline void NoteDrain(DrainSite site) {
@@ -291,7 +300,8 @@ inline void Report(const char* thread_name = "GPU thread") {
             counter_names{"download_bytes",   "download_copies",   "mme_dma_read_bytes",
                           "download_bytes_on_dma_pages", "method_writes", "same_value_writes",
                           "acquire_checks",   "acquire_waits",     "draws",
-                          "empty_draws"};
+                          "empty_draws",      "list_copied",       "list_synced",
+                          "list_no_page",     "list_draw_written", "list_stale"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

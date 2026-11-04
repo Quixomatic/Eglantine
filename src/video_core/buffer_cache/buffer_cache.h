@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <algorithm>
 #include <memory>
 #include <numeric>
@@ -1092,6 +1093,10 @@ void BufferCache<P>::BindHostDrawIndirectBuffers() {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+        // The draw reads these words on the GPU: a later upload to them in this batch must not
+        // be reordered ahead of it (DK Bananza resets its terrain draw records with inline
+        // writes right after the draws that read them; hoisted, every record read zero).
+        buffer.MarkUsage(buffer.Offset(binding.device_addr), binding.size);
     };
     if (current_draw_indirect->include_count) {
         bind_buffer(channel_state->count_buffer_binding);
@@ -1918,19 +1923,26 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
             std::scoped_lock lock{nx2_list_mutex};
             const auto it = nx2_list_pages.find(page);
             if (it == nx2_list_pages.end()) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ListNoPage, 1);
                 return Nx2ListRead::Unknown;
             }
             const Nx2ListPage& entry = it->second;
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
             if (!entry.draw_written && entry.synced_writes == entry.writes) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ListSynced, 1);
                 return Nx2ListRead::Synced;
             }
             if (!current(entry)) {
+                VideoCommon::Nx2Profile::Add(entry.draw_written ? VideoCommon::Nx2Profile::Counter::ListDrawWritten
+                             : !entry.copy ? VideoCommon::Nx2Profile::Counter::ListNoPage
+                                           : VideoCommon::Nx2Profile::Counter::ListStale,
+                             1);
                 return Nx2ListRead::Unknown;
             }
             // The lists after the first of a batch find the copy done: read it at once.
             if (runtime.IsFree(entry.copy_tick)) {
                 std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ListCopied, 1);
                 return Nx2ListRead::Copied;
             }
             tick = entry.copy_tick;
@@ -1942,9 +1954,11 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out) -> Nx
         const auto it = nx2_list_pages.find(page);
         if (it == nx2_list_pages.end() || !current(it->second) || it->second.copy_tick != tick ||
             it->second.copy_writes != writes) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ListStale, 1);
             return Nx2ListRead::Unknown;
         }
         std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ListCopied, 1);
         return Nx2ListRead::Copied;
     }
 }

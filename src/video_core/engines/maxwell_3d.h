@@ -3209,6 +3209,12 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// Split front, before an entry holding the remaining 5 parameters (at `record`) of the
+    /// pending macro call: true when that macro is DrawIndexedIndirect with a topology the host
+    /// draws indirectly. The host GPU then reads the record itself (the words may still be
+    /// written by queued GPU work: culling): the caller needs neither to wait for the back nor
+    /// to read the words fresh.
+    bool FrontTakeIndirectRecord(u32 parameter_method, GPUVAddr record);
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3390,6 +3396,12 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    /// Whether the native macro `method` starts is NVN's DrawIndexedIndirect (parameters:
+    /// topology, then a 5-word VkDrawIndexedIndirectCommand-style record), told by a dry run.
+    bool IsIndirectDrawMacro(FrontState& state, u32 method);
+    /// Back: one indexed draw whose count, instances, first index, base vertex and base instance
+    /// the host GPU reads from the guest record at `record` (as HLE_DrawIndexedIndirect).
+    void BackDrawIndexedIndirect(Core::System& system, u32 topology, GPUVAddr record);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

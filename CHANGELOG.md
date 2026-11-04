@@ -7,6 +7,42 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.8] - 2026-11-04
+
+Donkey Kong Bananza's GPU-culled draws are drawn by the host GPU straight from the records the culling
+writes: the open map goes from 14.5 to 17.5 fps and the view away from it from ~42 to 60 fps
+(bench_spawn, 1% lows 13.2 -> 15.5 and ~30 -> 51), rendering unchanged (baseline 0.94-0.97).
+
+### Changed
+- **GPU-written DrawIndexedIndirect records are drawn indirectly.** DK's culling pass writes a 5-word
+  record per mesh (index count, instances, first index, base vertex, base instance; culled meshes get a
+  count of 0) and a native macro draws each one. The split's front read every record on the CPU: a
+  drain of the back thread, a flush and often a host GPU round trip, ~2,100 times a frame, so the two
+  GPU threads and the host GPU took turns. The front now recognizes NVN's DrawIndexedIndirect macro by
+  a dry run of the macro code (no per-game hash) and, when its record is in an entry of its own, sends
+  the back a host `vkCmdDrawIndexedIndirect` reading the record from guest memory, then the macro's
+  clean-up writes. Split drains go from ~31,700 to ~1,200 a second. `EDEN_NX2_INDIRECT_RECORDS=0`
+  turns it off; `EDEN_NX2_INDIRECT_REPLACE=1` also replaces the base vertex/instance constants.
+
+### Fixed
+- Indirect draws mark their argument buffer as used, so a later upload to it in the same batch is not
+  reordered ahead of the draw (`BindHostDrawIndirectBuffers`).
+- The NX2 profiler's counters were stored in a fixed array of 10; it is now sized by the counter enum.
+
+### Added
+- Profiler counters for GPU-written command list reads (`list_copied`, `list_synced`, `list_no_page`,
+  `list_draw_written`, `list_stale`): why a list takes the slow drain-and-flush path.
+- Diagnostics: `EDEN_NX2_PBFLUSH_LOG` (which macro calls take parameters from GPU-written pages, and how
+  often the GPU really had newer words) and `EDEN_NX2_MACRO_TRACE=<method>` (parameters and register
+  writes of a macro's first calls).
+
+### Internal
+- Found with the MCP: `perf_sample`/`gpu_profile` (draw throughput pinned at ~110k/s, the front waiting
+  ~75%), the new `host_profile` (which drains and host waits, by call stack), `compare_runs` and
+  bisect switches. The black ground of the first version came from the back's method sink: state
+  writes wait there until an executable method arrives, and the indirect draw has to apply them first
+  (`ConsumeSink`).
+
 ## [0.1.7] - 2026-11-04
 
 A sampling profiler for the emulator's own threads, from the MCP, and fewer GPU-split drains for

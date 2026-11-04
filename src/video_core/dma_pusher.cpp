@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <map>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -119,6 +121,10 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        // The entry is the 5-word record of a DrawIndexedIndirect call the host GPU draws from
+        // guest memory (Maxwell3D::FrontTakeIndirectRecord): its words are not needed fresh.
+        bool indirect_record_entry = false;
+        bool skip_record_read = false;
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -138,14 +144,22 @@ bool DmaPusher::Step() {
                 bool flushed_parameters = false;
                 const GPUVAddr param_address = dma_state.dma_get;
                 const size_t param_bytes = words * sizeof(u32);
+                if (macro_payload && words == 5 && header.size == 5 && dma_state.method_count == 5 &&
+                    VideoCommon::GpuSplit::Get().Active() &&
+                    static_cast<Engines::Maxwell3D*>(engine_state)
+                        ->FrontTakeIndirectRecord(dma_state.method, param_address)) {
+                    indirect_record_entry = true;
+                }
+                skip_record_read = indirect_record_entry;
                 // With the split, drain only for words on pages GPU work wrote: a drain per macro
                 // whose parameters continue in their own entry was ~15,000 a second in DK
                 // Bananza's open areas, nearly all of them on CPU-written pages, and each one
                 // stopped the front until the back caught up. The back marks pages as it runs
                 // the work that writes them, so a page still unmarked is checked again after the
                 // queued compute and copy work ran (as for GPU-written command entries).
-                bool may_be_gpu_written = true;
-                if (auto& split = VideoCommon::GpuSplit::Get(); flush_parameters && words <= 64 && split.Active()) {
+                bool may_be_gpu_written = !indirect_record_entry;
+                if (auto& split = VideoCommon::GpuSplit::Get();
+                    !indirect_record_entry && flush_parameters && words <= 64 && split.Active()) {
                     may_be_gpu_written = IsGpuWrittenCommands(param_address, param_bytes);
                     if (!may_be_gpu_written && split.WaitForWriters()) {
                         may_be_gpu_written = IsGpuWrittenCommands(param_address, param_bytes);
@@ -162,6 +176,36 @@ bool DmaPusher::Step() {
                         if (flush_logs.fetch_add(1) < 20) {
                             LOG_INFO(HW_GPU, "Macro parameters at {:#x} ({} words) were written by the GPU: flushed",
                                      param_address, words);
+                        }
+                    }
+                }
+                // EDEN_NX2_PBFLUSH_LOG: which macro calls take parameters from GPU-written pages,
+                // and how often the GPU really had newer words (summary every 20000 calls).
+                if (static const bool log_params = std::getenv("EDEN_NX2_PBFLUSH_LOG") != nullptr;
+                    log_params && may_be_gpu_written && macro_payload) {
+                    struct Stats {
+                        u64 calls{};
+                        u64 flushed{};
+                        u32 logged{};
+                    };
+                    static std::map<std::pair<u32, size_t>, Stats> stats;
+                    static u64 total{};
+                    auto& entry_stats = stats[{dma_state.method, words}];
+                    ++entry_stats.calls;
+                    entry_stats.flushed += flushed_parameters ? 1 : 0;
+                    if (flushed_parameters && entry_stats.logged < 4) {
+                        ++entry_stats.logged;
+                        std::array<u32, 8> head{};
+                        memory_manager.ReadBlockUnsafe(param_address, head.data(),
+                                                       std::min<size_t>(words, 8) * sizeof(u32));
+                        LOG_INFO(HW_GPU, "pbflush sample: macro method {:#x} words {} (entry {}, {} left) at {:#x}: {:08x}",
+                                 dma_state.method, words, u64{header.size}, dma_state.method_count,
+                                 param_address, fmt::join(head, " "));
+                    }
+                    if (++total % 20000 == 0) {
+                        for (const auto& [key, value] : stats) {
+                            LOG_INFO(HW_GPU, "pbflush stats: macro method {:#x} words {}: {} calls, {} flushed newer GPU words",
+                                     key.first, key.second, value.calls, value.flushed);
                         }
                     }
                 }
@@ -217,9 +261,9 @@ bool DmaPusher::Step() {
         // written by a dispatch or copy still queued for it reads as unwritten, and its words as
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
         // billions of instances and lost the device loading a race).
-        bool gpu_written =
+        bool gpu_written = !skip_record_read &&
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+        if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -245,6 +289,12 @@ bool DmaPusher::Step() {
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            RecordParsedEntry(header, commands);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (skip_record_read) {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
