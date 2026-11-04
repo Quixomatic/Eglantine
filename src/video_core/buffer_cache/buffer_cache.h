@@ -907,7 +907,8 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        SynchronizeBufferMemo(index_sync_memo, channel_state->index_buffer.buffer_id, buffer,
+                              channel_state->index_buffer.device_addr, size);
     } else {
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
@@ -1024,7 +1025,8 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            SynchronizeBufferMemo(vertex_sync_memo[index], binding.buffer_id, buffer,
+                                  binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1164,10 +1166,20 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // The slot's memo skips the set lookup for a bank already in the set this frame.
+    auto& bank_memo = native_bank_memo[stage][index];
+    const auto note_bank = [&](bool in_set) {
+        if (in_set) {
+            bank_memo = {device_addr, frame_tick};
+        }
+        return in_set;
+    };
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
+        (bank_memo.first != device_addr || bank_memo.second != frame_tick) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
-        native_indirect_uniforms_this_frame.insert(device_addr).second) {
+        !note_bank(!native_indirect_uniforms_this_frame.insert(device_addr).second)) {
+        bank_memo = {device_addr, frame_tick};
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         u64 mapped_size = 0;
         while (mapped_size < size &&
@@ -2188,6 +2200,7 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
         total_used_memory -= Common::AlignUp(size, 1024);
         lru_cache.Free(buffer.getLRUID());
     }
+    ++buffer_layout_serial;
     const DAddr device_addr_begin = buffer.CpuAddr();
     const DAddr device_addr_end = device_addr_begin + size;
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
@@ -2207,6 +2220,33 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
         buffer.lru_touch_tick = frame_tick;
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
     }
+}
+
+template <class P>
+void BufferCache<P>::SynchronizeBufferMemo(SyncMemo& memo, BufferId buffer_id, Buffer& buffer,
+                                           DAddr device_addr, u32 size) {
+    // EDEN_NX2_SYNC_MEMO=0 synchronizes every bind, as before.
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    const u64 epoch = memory_tracker.CpuEpoch(device_addr, size);
+    if (enabled && epoch != 0 && memo.epoch == epoch && memo.buffer_id == buffer_id &&
+        memo.layout_serial == buffer_layout_serial && memo.device_addr <= device_addr &&
+        device_addr + size <= memo.device_addr + memo.size) {
+        Nx2Profile::Add(Nx2Profile::Counter::SyncSkipped, 1);
+        return;
+    }
+    SynchronizeBuffer(buffer, device_addr, size);
+    // The epoch read before synchronizing: a page modified meanwhile changes it, so the next
+    // bind synchronizes again.
+    memo = SyncMemo{
+        .buffer_id = buffer_id,
+        .device_addr = device_addr,
+        .size = size,
+        .layout_serial = buffer_layout_serial,
+        .epoch = epoch,
+    };
 }
 
 template <class P>
@@ -2574,8 +2614,18 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     const auto size = [&]() {
-        const u32 memory_layout_size =
-            static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+        const u64 map_serial = Tegra::g_gpu_map_serial.load(std::memory_order_acquire);
+        LayoutSizeMemo& memo = layout_size_memo[(gpu_addr >> 8) % layout_size_memo.size()];
+        if (memo.memory != gpu_memory || memo.gpu_addr != gpu_addr ||
+            memo.map_serial != map_serial) {
+            memo = LayoutSizeMemo{
+                .memory = gpu_memory,
+                .gpu_addr = gpu_addr,
+                .map_serial = map_serial,
+                .size = gpu_memory->GetMemoryLayoutSize(gpu_addr),
+            };
+        }
+        const u32 memory_layout_size = static_cast<u32>(memo.size);
         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
         const u32 packed_size = static_cast<u32>(next_qword);
         const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
@@ -2597,7 +2647,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
         return NULL_BINDING;
     }
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+    // Aligning down by the storage alignment stays inside the page: no second translation.
+    const std::optional<DAddr> device_addr =
+        ((aligned_gpu_addr ^ gpu_addr) >> Core::DEVICE_PAGEBITS) == 0
+            ? std::optional<DAddr>{*aligned_device_addr + (gpu_addr - aligned_gpu_addr)}
+            : gpu_memory->GpuToCpuAddress(gpu_addr);
     ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
                cbuf_index);
     // The end address used for size calculation does not need to be aligned

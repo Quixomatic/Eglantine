@@ -106,7 +106,9 @@ template <class Runtime, class DeviceMemory>
     const u8* source = nullptr;
     if constexpr (requires { device_memory.template GetPointer<u8>(device_addr); }) {
         source = device_memory.template GetPointer<u8>(device_addr);
-        if (source != nullptr &&
+        // Within one 4 KiB device page the range is contiguous; check the end only otherwise.
+        constexpr u64 device_page_mask = 0xFFF;
+        if (source != nullptr && (device_addr & device_page_mask) + size > device_page_mask + 1 &&
             device_memory.template GetPointer<u8>(device_addr + size - 1) != source + size - 1) {
             source = nullptr;
         }

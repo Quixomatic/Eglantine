@@ -567,6 +567,34 @@ private:
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 
+    /// A range synchronized while its tracker region had `epoch`: while the region's epoch is
+    /// unchanged no page of it became CPU-modified, so the range has nothing to upload.
+    struct SyncMemo {
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u64 size{};
+        u64 layout_serial{};
+        u64 epoch{};
+    };
+    /// SynchronizeBuffer, skipped while `memo` covers the range and nothing changed.
+    void SynchronizeBufferMemo(SyncMemo& memo, BufferId buffer_id, Buffer& buffer,
+                               DAddr device_addr, u32 size);
+    std::array<SyncMemo, 32> vertex_sync_memo{};
+    SyncMemo index_sync_memo{};
+    /// GetMemoryLayoutSize results (a lock and a map lookup each) for storage buffer bindings,
+    /// valid while the GPU address space is not remapped.
+    struct LayoutSizeMemo {
+        const Tegra::MemoryManager* memory{};
+        GPUVAddr gpu_addr{};
+        u64 map_serial{};
+        u64 size{};
+    };
+    mutable std::array<LayoutSizeMemo, 64> layout_size_memo{};
+    /// Changes whenever a buffer is registered or unregistered.
+    u64 buffer_layout_serial = 1;
+    /// Per (stage, constant buffer): the native 64 KiB bank last checked and the frame it was.
+    std::array<std::array<std::pair<DAddr, u64>, 18>, 5> native_bank_memo{};
+
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;

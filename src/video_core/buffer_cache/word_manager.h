@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <limits>
 #include <span>
@@ -119,6 +120,9 @@ struct WordManager {
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
+        if (enable && type == Type::CPU) {
+            cpu_epoch = NextCpuEpoch();
+        }
         std::vector<std::pair<VAddr, u64>> ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
             if (type == Type::CPU || type == Type::CachedCPU) {
@@ -247,6 +251,7 @@ struct WordManager {
         auto const cached_words = Span(Type::CachedCPU);
         auto const untracked_words = Span(Type::Untracked);
         auto const cpu_words = Span(Type::CPU);
+        cpu_epoch = NextCpuEpoch();
         std::vector<std::pair<VAddr, u64>> ranges;
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
             const u64 cached_bits = cached_words[word_index];
@@ -319,9 +324,17 @@ struct WordManager {
         return std::span<const u64>(heap.data() + num_words * size_t(type), num_words);
     }
 
+    /// A new value whenever pages of this region may have become CPU-modified (never reused, so
+    /// an equal epoch means no CPU-modified bit was set since it was read).
+    static u64 NextCpuEpoch() noexcept {
+        static std::atomic<u64> epoch{0};
+        return epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
+    u64 cpu_epoch = NextCpuEpoch();
 };
 
 } // namespace VideoCommon

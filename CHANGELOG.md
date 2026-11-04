@@ -7,6 +7,26 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.18] - 2026-11-04
+
+Buffer binding redoes less per draw: Donkey Kong Bananza's open map 22.9 -> 23.5 fps with the
+same build's switch off and on (1% low 20.3 -> 20.6), rendering unchanged.
+
+### Changed
+- **Vertex and index buffer binds skip synchronization while nothing changed.** Every bind walked
+  the memory tracker's page bits for CPU-modified data, ~1.3 million times a second in DK, almost
+  always finding none. Each tracker region (4 MiB) now carries an epoch that changes whenever any
+  of its pages may become CPU-modified; a bind whose range was synchronized at the current epoch
+  (same buffer, no buffer registered or removed since) skips the walk. `update buffers` 152 -> 130
+  ms/s on the GPU back thread. `EDEN_NX2_SYNC_MEMO=0` synchronizes every bind again.
+- Graphics storage buffer bindings keep `GetMemoryLayoutSize` results (a lock and a map lookup
+  each) until the GPU address space is remapped, and translate the address once instead of twice.
+- Native 64 KiB uniform banks are looked up in the per-frame set once per slot and frame, and small
+  uniform buffers inside one page take one host pointer lookup instead of two.
+
+### Added
+- Profiler counter `sync_skipped`.
+
 ## [0.1.17] - 2026-11-04
 
 The texture binding cache works and is on by default, and writes that repeat the bytes guest
