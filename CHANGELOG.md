@@ -7,6 +7,23 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.31] - 2026-11-04
+
+Fewer copies per uniform buffer bind and fewer worker wake-ups: Donkey Kong Bananza's open map holds
+25.2 fps with its 1% low up from 22.0 to 22.9 (facing away 53.9 -> 55.2; one run each), rendering
+unchanged (baseline 0.949).
+
+### Changed
+- **A uniform buffer bound at a new address keeps no CPU copy until that address comes back.** Each
+  slot's bytes were copied twice per change, to the stream and to a CPU copy for the next comparison,
+  even for per-object data bound at another address every draw (24% of DK's binds), which never
+  compared equal. Comparisons now only run against the same address. An address's second bind makes
+  the CPU copy and its third can reuse, so stream copies rise (244k -> 306k a second) while total
+  copies fall (~490k -> ~365k).
+- **`EDEN_NX2_WAKE_BATCH` defaults to 16** (was 4): the wake system call was 1.4% of the GPU back thread.
+  Submissions, present and waits still wake the worker at once.
+- Vertex buffer binding clears its binding lists instead of constructing new ones.
+
 ## [0.1.30] - 2026-11-04
 
 A cheaper register write path on the GPU back thread: Donkey Kong Bananza's open map 24.8 -> 25.3 fps

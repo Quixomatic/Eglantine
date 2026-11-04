@@ -323,12 +323,12 @@ void Scheduler::DispatchWork(bool force_wake) {
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
-        // An idle worker is woken for every few chunks (it records them in one go), and at once
+        // An idle worker is woken for every 16 chunks (it records them in one go), and at once
         // when something waits for it: one wake per dispatch was ~7% of DK Bananza's GPU back
-        // thread with the syscalls.
+        // thread with the syscalls, one per 4 chunks ~1.4%.
         static const size_t WakeBatch = [] {
             const char* value = std::getenv("EDEN_NX2_WAKE_BATCH");
-            return value != nullptr ? std::max<size_t>(1, std::strtoul(value, nullptr, 10)) : size_t{4};
+            return value != nullptr ? std::max<size_t>(1, std::strtoul(value, nullptr, 10)) : size_t{16};
         }();
         bool wake;
         {
