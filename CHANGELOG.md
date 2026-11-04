@@ -7,6 +7,41 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.4] - 2026-11-03
+
+Brings in upstream `nx2` 8615d8d53e (210 commits). Donkey Kong Bananza still renders correctly and
+replays to_gameplay (65 s from boot); bench_spawn 12.6 / 39.1 fps, the same as 0.1.2.
+
+### Added
+- **Upstream's work since the fork**, among them: game DLSS network emulation with health checks and a
+  replacement upscale (Fortune's Weave), native geometry shaders, more Ampere instruction forms
+  (LEA.HI.X, MUFU, sub-word local spills, F2I |Rs|, guarded ULEA/UIADD3), SUST with partial channel
+  masks, storage-buffer tracking that stops at loaded pointers, zero-copy chunked texture uploads, a guard
+  against garbage draw counts, the NUP metadata editor, the Hyrule Warriors and Fast Fusion fixes.
+
+### Changed
+- **HMMA outside a recognized game DLSS evaluation is emulated again.** Upstream emulates matrix
+  multiplies only inside the evaluations it recognizes (Fortune's Weave's); DK Bananza's upscaler is not
+  one, so its passes were rejected and the scene went purple. Inside a recognized evaluation upstream's
+  checks still decide. `EDEN_NX2_TENSOR=off` rejects HMMA again.
+
+### Fixed
+- Merge duplicates both sides had added (texture `UploadInChunks`, geometry OUT/LEPC/0x357, a G8R24
+  format mapping): upstream's versions kept.
+- Tests: the global-address test passes an environment; the NUP metadata test closes the archive before
+  editing it again (Windows can't replace an open file); the vote and F2I tests expect UR28 mirrors and
+  the native I8 conversion.
+
+### Internal
+- Merge choices, per hunk: upstream's lowering API, HMMA (f32, borrowed registers), LEA.HI.X, MUFU,
+  I2F immediates; ours where it covers more (guarded uniform ops with the post-emission check, UR28+
+  mirrors for VOTEU, unsigned and signed I8 F2I, 16-bit I2F from uniform registers, TLDS .F16, ignored
+  spill cache hints); both for the svc trace hook, pipeline stats with the mesh check, draw counters with
+  the draw guard, the descriptor-buffer texel path with the invalid-format guard, pruned searches with the
+  memory-load stop, MKW's fps patch (upstream's) with the DK 30 fps lock.
+- Known issue: one crash (access violation recording `QuadIndexBuffer::BindBuffer`) during a bench_spawn
+  run; not reproduced on the second run.
+
 ## [0.1.3] - 2026-11-03
 
 The main window's title shows the build again instead of PokeDinner's fixed string.

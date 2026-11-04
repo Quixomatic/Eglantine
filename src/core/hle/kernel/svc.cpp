@@ -2514,6 +2514,7 @@ void Call(Core::System& system, u32 imm) {
     if (svc_hook != nullptr) {
         svc_in = {GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3)};
     }
+    GetCurrentThread(kernel).SetEnteredKernel();
     //kernel.EnterSVCProfile();
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),

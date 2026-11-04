@@ -133,6 +133,14 @@ public:
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
+    bool SupportsGameDlssNetwork() const override;
+    bool UsesNvidiaDlss() const override;
+    bool CanProbeGameDlssOutput() const override {
+        return true;
+    }
+    std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        const Tegra::Engines::Fermi2D::Surface& src,
+        const Tegra::Engines::Fermi2D::Surface& dst) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
@@ -168,6 +176,7 @@ private:
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
+    bool TryNx2IndirectReset();
 
     void FlushWork();
 

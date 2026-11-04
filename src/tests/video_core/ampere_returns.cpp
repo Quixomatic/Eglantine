@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
@@ -77,12 +78,16 @@ TEST_CASE("Ampere callees reject a wide multiply over the link", "[video_core][a
     REQUIRE(lowered.error_offset == 0x30);
 }
 
-TEST_CASE("Ampere half matrix multiply accumulates in f32 by default", "[video_core][ampere]") {
+TEST_CASE("Ampere half matrix multiply accumulates in f32", "[video_core][ampere]") {
     const std::array<Instruction, 2> code{{
         {{0x1008723c, 0x20, 0x00000828, 0}},
         {{0x0000794d, 0, 0x03800000, 0}},
     }};
-    const auto lowered = LowerToMaxwell(code);
+    // Only the game's own DLSS network passes ask for matrix multiplies (or EDEN_NX2_TENSOR).
+    if (std::getenv("EDEN_NX2_TENSOR") == nullptr) {
+        REQUIRE(!static_cast<bool>(LowerToMaxwell(code)));
+    }
+    const auto lowered = LowerToMaxwell(code, {.tensor = true});
     REQUIRE(static_cast<bool>(lowered));
 
     // K=16: 8 pairs x 2 rows x 2 halves x 2 columns of f32 FFMA, and no f16 HFMA2 chain (which
