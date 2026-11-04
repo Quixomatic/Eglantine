@@ -1319,6 +1319,15 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
         return;
     }
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        u64 bytes = 0;
+        for (const auto& [addr, size] : sequences) {
+            bytes += size;
+        }
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InvalRanges,
+                                     sequences.size());
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InvalBytes, bytes);
+    }
     {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
@@ -1627,7 +1636,21 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         gpu_memory->WriteBlock(address, memory.data(), copy_size);
         return;
     }
-    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    // Writes of the bytes guest memory already holds (DK resets its indirect records and rewrites
+    // its constants with the same values every frame) leave every cache valid where the buffer
+    // cache has no newer GPU data (checked below): EDEN_NX2_INLINE_SAME=0 invalidates them anyway.
+    static const bool skip_same = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    bool same_bytes = false;
+    if (skip_same && (*cpu_addr & (Core::DEVICE_PAGESIZE - 1)) + copy_size <= Core::DEVICE_PAGESIZE) {
+        const u8* const existing = device_memory.GetPointer<u8>(*cpu_addr);
+        same_bytes = existing != nullptr && std::memcmp(existing, memory.data(), copy_size) == 0;
+    }
+    if (!same_bytes) {
+        gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    }
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
@@ -1647,6 +1670,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     // Pending query results must not land over the new words later: drop them now.
     query_cache.InvalidateRegion(*cpu_addr, copy_size);
+    if (!uploaded && same_bytes) {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InlineSame, 1);
+        return;
+    }
     if (!uploaded && defer) {
         // Title 1 makes thousands of small inline writes between draws (~10% of the GPU
         // thread invalidating every cache for each). Guest memory is written; the buffer,
@@ -1654,6 +1681,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         // before anything of theirs is used. Writes into GPU-written buffer data were uploaded
         // in place above, as before.
         gpu_memory->AccumulateInvalidation(address, copy_size);
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::InlineDeferred, 1);
         return;
     }
     {

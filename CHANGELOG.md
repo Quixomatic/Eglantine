@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.17] - 2026-11-04
+
+The texture binding cache works and is on by default, and writes that repeat the bytes guest
+memory already holds no longer invalidate every cache: Donkey Kong Bananza's open map 22.0 -> 22.8
+fps (1% low 19.9 -> 20.8, ~148k -> ~157k draws a second), rendering unchanged.
+
+### Fixed
+- **The binding cache's hit path ran two failing `ASSERT`s per draw.** It checked the view and
+  sampler counts before filling them from the cache, so every hit logged two critical lines
+  (~77,000 a second): that was the whole 6.1 fps of v0.1.16. The counts are checked after the fill.
+
+### Changed
+- **Texture binding cache on by default** (`EDEN_NX2_BINDCACHE=0` turns it off). In DK 92% of
+  draws reuse their image views and samplers; `read handles` 56 -> 36 and `fill image views`
+  46 -> 29 ms/s on the GPU back thread, 0 mismatches in verify mode.
+- **Inline and constant buffer data writes of unchanged bytes skip cache invalidation.** DK resets
+  its indirect draw records and rewrites its constants with the same values every frame: 64% of
+  inline writes (~105k a second) and 63% of constant buffer data writes (~437k a second) changed
+  nothing. They still drop pending query results; writes onto buffer data the GPU may have written
+  (uploaded in place, or on a page the buffer cache ever marked GPU-written) invalidate as before.
+  Ranges invalidated per second 383k -> 182k. `EDEN_NX2_INLINE_SAME=0` turns it off.
+
+### Added
+- Profiler counters `inval_ranges` / `inval_bytes` (ranges invalidated in every cache),
+  `inline_deferred` / `inline_same`, `cb_same` / `cb_written`, `sync_uploads` /
+  `sync_upload_bytes` (buffer synchronizations that uploaded CPU-modified data).
+
 ## [0.1.16] - 2026-11-04
 
 A value-based binding cache for textures in `GraphicsPipeline::Configure`, off by default while its

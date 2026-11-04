@@ -392,12 +392,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     // Binding cache, texture side: reuse the last resolution's image views and samplers while the
     // handle words and the TIC/TSC entries they select compare equal (read through kept host
-    // pointers). Off by default while its hit path is slower than expected (DK: 92% hits, no
-    // mismatches, but 6.1 fps): EDEN_NX2_BINDCACHE=1 turns it on, EDEN_NX2_BINDCACHE_VERIFY=1
-    // also resolves every hit the full way and logs differences.
+    // pointers). EDEN_NX2_BINDCACHE=0 turns it off, EDEN_NX2_BINDCACHE_VERIFY=1 also resolves
+    // every hit the full way and logs differences.
     static const bool bindcache_enabled = [] {
         const char* value = std::getenv("EDEN_NX2_BINDCACHE");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     static const bool bindcache_verify = std::getenv("EDEN_NX2_BINDCACHE_VERIFY") != nullptr;
     constexpr bool texture_cacheable_spec =
@@ -603,11 +602,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             config_stage(4);
         }
     }
-    ASSERT(views.size() == num_image_elements);
-    ASSERT(samplers.size() == num_textures);
     if (texture_hit) {
         views.assign(tbc.views.begin(), tbc.views.end());
         samplers.assign(tbc.samplers.begin(), tbc.samplers.end());
+    }
+    ASSERT(views.size() == num_image_elements);
+    ASSERT(samplers.size() == num_textures);
+    if (texture_hit) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.PrepareImageViews(std::span(views.data(), views.size()));
         Profile::Add(Profile::Counter::BindCacheHits, 1);

@@ -15,6 +15,7 @@
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
@@ -528,6 +529,26 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
+    // Constant buffer data of the bytes guest memory already holds (DK rewrites its constants
+    // with the same values every frame) leaves every cache valid, unless the buffer cache may
+    // hold newer GPU-written data for the page (the bit is sticky, so this errs to invalidating).
+    // Switch 2 titles only, where that bit is kept; EDEN_NX2_INLINE_SAME=0 invalidates anyway.
+    static const bool skip_same = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_same && size != 0 && g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (gpu_dest_addr & (Core::DEVICE_PAGESIZE - 1)) + size <= Core::DEVICE_PAGESIZE) {
+        if (const auto device = GpuToCpuAddress(gpu_dest_addr);
+            device && !Nx2IsGpuWritten(*device)) {
+            const u8* const existing = memory.GetPointer<u8>(*device);
+            if (existing != nullptr && std::memcmp(existing, src_buffer, size) == 0) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CbSame, 1);
+                return;
+            }
+        }
+    }
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CbWritten, 1);
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
     accumulator.Add(gpu_dest_addr, size);
 }

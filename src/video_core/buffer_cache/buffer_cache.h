@@ -2244,6 +2244,8 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         if (total_size_bytes == 0) {
             return true;
         }
+        Nx2Profile::Add(Nx2Profile::Counter::SyncUploads, 1);
+        Nx2Profile::Add(Nx2Profile::Counter::SyncUploadBytes, total_size_bytes);
         const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
         UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
         // Mapped uploads carry their own barriers (or run in the upload command buffer, which
