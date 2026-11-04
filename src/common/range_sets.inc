@@ -37,14 +37,30 @@ struct RangeSet<AddressType>::RangeSetImpl {
     ~RangeSetImpl() = default;
 
     void Add(AddressType base_address, size_t size) {
+        if (size == 0) {
+            return;
+        }
         AddressType end_address = base_address + static_cast<AddressType>(size);
         IntervalType interval{base_address, end_address};
+        // Ranges are joined, so a range already covered lies in one interval: one lookup instead
+        // of an insert-and-merge (the buffer cache re-adds the same written ranges every draw).
+        const auto it = m_ranges_set.lower_bound(interval);
+        if (it != m_ranges_set.end() && boost::icl::contains(*it, interval)) {
+            return;
+        }
         m_ranges_set.add(interval);
     }
 
     void Subtract(AddressType base_address, size_t size) {
+        if (size == 0) {
+            return;
+        }
         AddressType end_address = base_address + static_cast<AddressType>(size);
         IntervalType interval{base_address, end_address};
+        const auto it = m_ranges_set.lower_bound(interval);
+        if (it == m_ranges_set.end() || !boost::icl::intersects(*it, interval)) {
+            return;
+        }
         m_ranges_set.subtract(interval);
     }
 

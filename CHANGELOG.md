@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.19] - 2026-11-04
+
+Range sets skip work that changes nothing: Donkey Kong Bananza's open map 23.5 -> 24.0 fps (1% low
+20.6 -> 21.2), rendering unchanged.
+
+### Changed
+- **`Common::RangeSet::Add` returns at once when the range is already covered**, and `Subtract` when
+  it overlaps nothing: one lookup instead of Boost's insert-and-merge or erase walk. The buffer cache
+  re-adds the same GPU-written ranges for every draw (`MarkWrittenBuffer`: `RangeSet::Add` was 2.7%
+  of the GPU back thread) and subtracts written ranges from download sets that rarely hold them.
+
+### Added
+- Tests for both early returns (`src/tests/common/range_sets.cpp`).
+
 ## [0.1.18] - 2026-11-04
 
 Buffer binding redoes less per draw: Donkey Kong Bananza's open map 22.9 -> 23.5 fps with the
