@@ -828,10 +828,45 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (num_translated.load(std::memory_order_acquire) != 0) {
         AdoptTranslatedGraphicsPipelines();
     }
+    auto& dirty{maxwell3d->dirty.flags};
+    const bool shaders_changed{dirty[VideoCommon::Dirty::Shaders]};
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
+        gated_pipeline = nullptr;
         return nullptr;
     }
+    // C: the draw's pipeline state is unchanged from the last lookup (98% of draws in DK): reuse
+    // its pipeline without re-reading every register into the key and comparing it.
+    // EDEN_NX2_KEY_GATE=0 turns it off; EDEN_NX2_KEY_GATE_VERIFY=1 refreshes the key anyway and
+    // logs any difference.
+    static const bool gate_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_KEY_GATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool gate_verify = std::getenv("EDEN_NX2_KEY_GATE_VERIFY") != nullptr;
+    const u32 topology{static_cast<u32>(maxwell3d->draw_manager.draw_state.topology)};
+    const u32 engine_state{static_cast<u32>(maxwell3d->engine_state)};
+    if (gate_enabled && gated_pipeline != nullptr && gated_pipeline == current_pipeline &&
+        !shaders_changed && !dirty[VideoCommon::Dirty::PipelineKey] &&
+        topology == gated_topology && engine_state == gated_engine_state) {
+        if (gate_verify) [[unlikely]] {
+            GraphicsPipelineCacheKey check{graphics_key};
+            check.state.Refresh(*maxwell3d, dynamic_features);
+            if (std::memcmp(&check, &graphics_key, sizeof(check)) != 0) {
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render_Vulkan, "Pipeline key gate mismatch: key changed without "
+                                               "Dirty::PipelineKey");
+                }
+            }
+        }
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
+    dirty[VideoCommon::Dirty::PipelineKey] = false;
+    gated_pipeline = nullptr;
+    gated_topology = topology;
+    gated_engine_state = engine_state;
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
 
     if (current_pipeline) {
@@ -839,10 +874,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (next) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);
+            gated_pipeline = current_pipeline;
             return BuiltPipeline(current_pipeline);
         }
     }
-    return CurrentGraphicsPipelineSlowPath();
+    GraphicsPipeline* const found{CurrentGraphicsPipelineSlowPath()};
+    if (found != nullptr && found == current_pipeline) {
+        gated_pipeline = current_pipeline;
+    }
+    return found;
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {

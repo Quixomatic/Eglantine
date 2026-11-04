@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
+#include <vector>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -354,6 +356,30 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
+    // Diagnostics: EDEN_NX2_REG_HISTOGRAM=1 logs, every 20 s, the registers that marked state
+    // dirty most often (which registers change between draws).
+    static const bool histogram = std::getenv("EDEN_NX2_REG_HISTOGRAM") != nullptr;
+    if (histogram) [[unlikely]] {
+        static std::vector<u64> counts(Regs::NUM_REGS);
+        static auto window = std::chrono::steady_clock::now();
+        ++counts[method];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - window > std::chrono::seconds{20}) {
+            window = now;
+            std::vector<u32> order(Regs::NUM_REGS);
+            for (u32 i = 0; i < order.size(); ++i) {
+                order[i] = i;
+            }
+            std::partial_sort(order.begin(), order.begin() + 48, order.end(),
+                              [](u32 a, u32 b) { return counts[a] > counts[b]; });
+            std::string line;
+            for (u32 i = 0; i < 48 && counts[order[i]] != 0; ++i) {
+                line += fmt::format(" {:#x}:{}", order[i], counts[order[i]] / 20);
+            }
+            LOG_INFO(HW_GPU, "Register dirty histogram (per s):{}", line);
+            std::ranges::fill(counts, 0);
+        }
+    }
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {

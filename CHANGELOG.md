@@ -7,6 +7,29 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.27] - 2026-11-04
+
+Batching (plan C), first piece: a draw whose pipeline state did not change reuses the previous
+pipeline without rebuilding its key. In Donkey Kong Bananza 98% of draws keep the previous draw's
+pipeline, textures and framebuffer; verified on the benchmark route (0 key mismatches, baseline
+0.947); fps change within noise (24.3-24.9 vs 24.4).
+
+### Changed
+- **Pipeline key gate** (`PipelineCache::CurrentGraphicsPipeline`): a new dirty flag,
+  `Dirty::PipelineKey` (dirty table 2), is set by every 3D register write except per-draw data the
+  key never reads (constant buffer uploads and binds, draw parameters, index buffer, vertex stream
+  addresses and limits, base vertex/instance, semaphores, shadow RAM control, macro upload). While
+  it is clear, the shaders are unchanged and the topology and engine state match, the last lookup's
+  pipeline is reused without `FixedPipelineState::Refresh` and the key comparison.
+  `EDEN_NX2_KEY_GATE=0` turns it off; `EDEN_NX2_KEY_GATE_VERIFY=1` refreshes the key anyway and
+  logs "Pipeline key gate mismatch" when it changed.
+
+### Added
+- Profiler counters `shape_same`, `merge_candidate`, `merge_contiguous` (C measurements: in DK
+  98% / 3.4% / 0% of draws).
+- Diagnostics: `EDEN_NX2_REG_HISTOGRAM=1` logs the 3D registers that mark state dirty most often
+  (slow: for investigation only).
+
 ## [0.1.26] - 2026-11-04
 
 Two shader recompiler bugs found while researching bindless textures.

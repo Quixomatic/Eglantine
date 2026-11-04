@@ -45,6 +45,11 @@ enum : u8 {
     // Special entries
     DepthBiasGlobal,
 
+    /// Any register FixedPipelineState::Refresh may read changed: every register except the
+    /// per-draw data ones (constant buffer uploads and binds, draw parameters, index and vertex
+    /// buffer addresses, semaphores; dirty table 2, SetupDirtyPipelineKey).
+    PipelineKey,
+
     LastCommonEntry,
 };
 

@@ -431,6 +431,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     samplers.reserve(num_textures);
 
     namespace Profile = VideoCommon::Nx2Profile;
+    // C (batching) measurement: uniform buffers that changed bytes during this draw.
+    const u64 uniform_copies_before{
+        Profile::Enabled() ? Profile::CounterValue(Profile::Counter::UniformCopied) : 0};
+    bool same_textures_as_last{};
+    bool same_geometry_as_last{};
     {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
         texture_cache.SynchronizeDescriptors(false);
@@ -748,6 +753,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             buffers = mix(buffers, stream.Address() ^ (u64{stream.stride.Value()} << 52));
         }
         buffers = mix(buffers, regs.index_buffer.StartAddress());
+        u64 geometry = 0xcbf29ce484222325ULL;
+        for (const auto& stream : regs.vertex_streams) {
+            geometry = mix(geometry, stream.Address() ^ (u64{stream.stride.Value()} << 52));
+        }
+        geometry = mix(geometry, regs.index_buffer.StartAddress());
+        geometry = mix(geometry, static_cast<u64>(regs.index_buffer.format));
+        static u64 last_geometry{};
+        same_textures_as_last = textures == last_textures;
+        same_geometry_as_last = geometry == last_geometry;
+        last_geometry = geometry;
         Profile::Add(Profile::Counter::SameTextures, textures == last_textures ? 1 : 0);
         Profile::Add(Profile::Counter::SameBuffers, buffers == last_buffers ? 1 : 0);
         last_textures = textures;
@@ -946,6 +961,20 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if (IsBuilt() && !pipeline) {
         return false;
+    }
+    if (Profile::Enabled()) [[unlikely]] {
+        // Shape: pipeline + textures (hashed together above) and framebuffer. A merge candidate
+        // also keeps its vertex/index bindings and no small uniform buffer changed bytes.
+        static const void* last_framebuffer{};
+        const void* const framebuffer{texture_cache.GetFramebuffer()};
+        const bool shape{same_textures_as_last && framebuffer == last_framebuffer};
+        last_framebuffer = framebuffer;
+        const bool uniforms_same{Profile::CounterValue(Profile::Counter::UniformCopied) ==
+                                 uniform_copies_before};
+        const bool candidate{shape && same_geometry_as_last && uniforms_same};
+        Profile::Add(Profile::Counter::ShapeSame, shape ? 1 : 0);
+        Profile::Add(Profile::Counter::MergeCandidate, candidate ? 1 : 0);
+        Profile::t_merge_candidate = candidate;
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);

@@ -144,7 +144,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
 /// Number of Counter values (the enum is below; checked there).
-inline constexpr size_t CounterCount = 30;
+inline constexpr size_t CounterCount = 33;
 
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
@@ -223,6 +223,9 @@ enum class Counter : u32 {
     SyncUploads,    ///< Buffer synchronizations that uploaded CPU-modified data
     SyncUploadBytes, ///< ...their bytes
     SyncSkipped,    ///< Vertex/index synchronizations skipped (region unchanged since the last)
+    ShapeSame,      ///< Draws with the previous draw's pipeline, textures and framebuffer
+    MergeCandidate, ///< ...and its vertex/index bindings, with no uniform buffer changing bytes
+    MergeContiguous, ///< ...indirect, reading the record right after the previous draw's
     Count,
 };
 static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
@@ -240,6 +243,14 @@ inline std::unordered_set<u64>& DmaReadPages() {
     static std::unordered_set<u64> pages;
     return pages;
 }
+
+/// This thread's running total of a counter (for deltas around a piece of work).
+[[nodiscard]] inline u64 CounterValue(Counter counter) {
+    return t_data.counters[static_cast<size_t>(counter)];
+}
+
+/// C (batching) measurement: whether the latest configured draw could merge with the one before.
+inline thread_local bool t_merge_candidate{};
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
@@ -321,7 +332,8 @@ inline void Report(const char* thread_name = "GPU thread") {
                           "uniform_copied",   "bindcache_hits",    "bindcache_verified",
                           "inval_ranges",     "inval_bytes",       "inline_deferred",
                           "inline_same",      "cb_same",           "cb_written",
-                          "sync_uploads",     "sync_upload_bytes", "sync_skipped"};
+                          "sync_uploads",     "sync_upload_bytes", "sync_skipped",
+                          "shape_same",       "merge_candidate",   "merge_contiguous"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

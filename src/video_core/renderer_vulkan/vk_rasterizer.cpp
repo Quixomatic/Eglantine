@@ -856,6 +856,18 @@ void RasterizerVulkan::DrawIndirect() {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
         const auto& buffer = indirect_buffer.first;
         const auto& offset = indirect_buffer.second;
+        if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+            // C (batching) measurement: a merge candidate whose record follows the previous one.
+            static VkBuffer last_buffer{};
+            static u64 last_end{};
+            const VkBuffer handle{buffer->Handle()};
+            if (VideoCommon::Nx2Profile::t_merge_candidate && handle == last_buffer &&
+                offset == last_end) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MergeContiguous, 1);
+            }
+            last_buffer = handle;
+            last_end = offset + (params.stride != 0 ? params.stride : params.buffer_size);
+        }
         if (params.is_byte_count) {
             scheduler.Record([buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
