@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.20] - 2026-11-04
+
+Inline writes stop taking the query cache's lock for pages without queries: Donkey Kong Bananza's
+open map 24.0 -> 24.4 fps (1% low 21.2 -> 22.1), rendering unchanged.
+
+### Changed
+- **The query cache keeps a bit filter of the device pages that ever held a cached query** and
+  skips its mutex and page lookups for ranges with none (`QueryCacheBase::IterateCache`). Every
+  inline write invalidates queries in its range, and DK's indirect record resets made tens of
+  thousands of them a second, each locking `cache_mutex` (~1.5% of the GPU back thread) to find
+  nothing. The filter never clears; a stale bit only takes the old path.
+
 ## [0.1.19] - 2026-11-04
 
 Range sets skip work that changes nothing: Donkey Kong Bananza's open map 23.5 -> 24.0 fps (1% low
