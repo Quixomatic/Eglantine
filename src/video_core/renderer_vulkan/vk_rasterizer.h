@@ -177,6 +177,8 @@ private:
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
     bool TryNx2IndirectReset();
+    /// Whether the draw being prepared may join the previous draw's multi-draw (C).
+    bool draw_mergeable{};
     /// TryNx2IndirectReset's per-reset scratch (kept to avoid allocating every reset).
     std::vector<GPUVAddr> reset_gpu_addresses;
     std::vector<DAddr> reset_device_addresses;

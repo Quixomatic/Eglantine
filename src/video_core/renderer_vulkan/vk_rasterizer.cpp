@@ -527,6 +527,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure("configure failed");
         return;
     }
+    // A multi-draw numbers its draws (the draw index builtin) and transform feedback appends per
+    // draw: those draws are recorded on their own.
+    draw_mergeable = !pipeline->ReadsDrawIndex() && maxwell3d->regs.transform_feedback_enabled == 0;
 
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
@@ -813,16 +816,17 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             });
             return;
         }
-        scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
-            if (draw_params.is_indexed) {
-                cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
-                                   draw_params.first_index, draw_params.base_vertex,
-                                   draw_params.base_instance);
-            } else {
-                cmdbuf.Draw(draw_params.num_vertices, draw_params.num_instances,
-                            draw_params.base_vertex, draw_params.base_instance);
-            }
-        });
+        // C: consecutive draws of identical state are recorded as one multi-draw.
+        if (draw_params.is_indexed) {
+            scheduler.RecordDrawIndexed(draw_mergeable, draw_params.num_vertices,
+                                        draw_params.num_instances, draw_params.first_index,
+                                        static_cast<s32>(draw_params.base_vertex),
+                                        draw_params.base_instance);
+        } else {
+            scheduler.RecordDraw(draw_mergeable, draw_params.num_vertices,
+                                 draw_params.num_instances, draw_params.base_vertex,
+                                 draw_params.base_instance);
+        }
 
         // Log draw call
         if (GPU::Logging::IsActive() &&
@@ -895,16 +899,29 @@ void RasterizerVulkan::DrawIndirect() {
             });
             return;
         }
-        scheduler.Record([buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
-            if (params.is_indexed) {
-                cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
-                                           static_cast<u32>(params.max_draw_counts),
-                                           static_cast<u32>(params.stride));
-            } else {
-                cmdbuf.DrawIndirect(buffer_obj, offset, static_cast<u32>(params.max_draw_counts),
-                                    static_cast<u32>(params.stride));
-            }
-        });
+        if (params.max_draw_counts == 1) {
+            // C: single records read one after another are drawn as one multi-draw indirect.
+            const u32 record_size{params.is_indexed
+                                      ? static_cast<u32>(sizeof(VkDrawIndexedIndirectCommand))
+                                      : static_cast<u32>(sizeof(VkDrawIndirectCommand))};
+            const u32 stride{params.stride != 0 ? static_cast<u32>(params.stride) : record_size};
+            scheduler.RecordDrawIndirect(draw_mergeable && stride >= record_size &&
+                                             stride % 4 == 0,
+                                         params.is_indexed, buffer->Handle(), offset, stride);
+        } else {
+            scheduler.Record([buffer_obj = buffer->Handle(), offset,
+                              params](vk::CommandBuffer cmdbuf) {
+                if (params.is_indexed) {
+                    cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
+                                               static_cast<u32>(params.max_draw_counts),
+                                               static_cast<u32>(params.stride));
+                } else {
+                    cmdbuf.DrawIndirect(buffer_obj, offset,
+                                        static_cast<u32>(params.max_draw_counts),
+                                        static_cast<u32>(params.stride));
+                }
+            });
+        }
 
         // Log indirect draw call
         if (GPU::Logging::IsActive() &&

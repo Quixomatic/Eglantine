@@ -300,6 +300,9 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    for (const Shader::Info& info : stage_infos) {
+        reads_draw_index |= info.loads[Shader::IR::Attribute::DrawID];
+    }
 
     // Bindless textures: the same decision the pipeline cache made when it emitted the shaders.
     TextureHeap* const heap{texture_cache.GetRuntime().texture_heap.get()};
@@ -1066,6 +1069,28 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (update_descriptors) {
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
+    }
+    // C: this pipeline's previous draw is still pending in the scheduler, so nothing at all was
+    // recorded since (no render pass change, helper pass, barrier or other pipeline), and this
+    // draw binds exactly what that one bound: record nothing, and the draw can join its batch.
+    {
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const auto rescaling_now{rescaling.Data()};
+        const size_t payload_bytes{num_descriptor_entries * sizeof(DescriptorUpdateEntry)};
+        if (scheduler.HasPendingDraws() && !bind_pipeline && !bind_descriptor_buffer &&
+            !update_rescaling && recorded_offset == descriptor_buffer_offset &&
+            recorded_render_area_used == render_area.uses_render_area &&
+            recorded_render_area == render_area.words && recorded_rescaling == rescaling_now &&
+            recorded_payload.size() == num_descriptor_entries &&
+            std::memcmp(recorded_payload.data(), entries, payload_bytes) == 0) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SkippedBindings, 1);
+            return true;
+        }
+        recorded_payload.assign(entries, entries + num_descriptor_entries);
+        recorded_rescaling = rescaling_now;
+        recorded_render_area_used = render_area.uses_render_area;
+        recorded_render_area = render_area.words;
+        recorded_offset = descriptor_buffer_offset;
     }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,

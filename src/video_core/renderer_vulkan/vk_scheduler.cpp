@@ -10,12 +10,14 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
+#include "video_core/nx2_profile.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -49,6 +51,11 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+    // EDEN_NX2_MERGE_DRAWS=0 records every draw on its own.
+    const char* const merge_value = std::getenv("EDEN_NX2_MERGE_DRAWS");
+    merge_draws = merge_value == nullptr || merge_value[0] != '0';
+    multi_draw = device.IsExtMultiDrawSupported();
+    multi_draw_indirect = device.IsMultiDrawIndirectSupported();
 
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
@@ -56,6 +63,147 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
 }
 
 Scheduler::~Scheduler() = default;
+
+namespace {
+// Draws per batch (VK_EXT_multi_draw guarantees maxMultiDrawCount >= 1024).
+constexpr size_t MaxMergedDraws = 256;
+} // Anonymous namespace
+
+void Scheduler::RecordDraw(bool mergeable, u32 vertex_count, u32 instance_count, u32 first_vertex,
+                           u32 first_instance) {
+    auto& pending = pending_draws;
+    if (pending.kind == PendingDraws::Kind::Draw && mergeable &&
+        pending.instance_count == instance_count && pending.first_instance == first_instance &&
+        pending.draws.size() < MaxMergedDraws) {
+        pending.draws.push_back({.firstVertex = first_vertex, .vertexCount = vertex_count});
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MergedDraws, 1);
+        return;
+    }
+    FlushPendingDraws();
+    if (!merge_draws || !mergeable) {
+        Record([vertex_count, instance_count, first_vertex,
+                first_instance](vk::CommandBuffer cmdbuf) {
+            cmdbuf.Draw(vertex_count, instance_count, first_vertex, first_instance);
+        });
+        return;
+    }
+    pending.kind = PendingDraws::Kind::Draw;
+    pending.instance_count = instance_count;
+    pending.first_instance = first_instance;
+    pending.draws.push_back({.firstVertex = first_vertex, .vertexCount = vertex_count});
+}
+
+void Scheduler::RecordDrawIndexed(bool mergeable, u32 index_count, u32 instance_count,
+                                  u32 first_index, s32 vertex_offset, u32 first_instance) {
+    auto& pending = pending_draws;
+    if (pending.kind == PendingDraws::Kind::DrawIndexed && mergeable &&
+        pending.instance_count == instance_count && pending.first_instance == first_instance &&
+        pending.indexed_draws.size() < MaxMergedDraws) {
+        pending.indexed_draws.push_back(
+            {.firstIndex = first_index, .indexCount = index_count, .vertexOffset = vertex_offset});
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MergedDraws, 1);
+        return;
+    }
+    FlushPendingDraws();
+    if (!merge_draws || !mergeable) {
+        Record([index_count, instance_count, first_index, vertex_offset,
+                first_instance](vk::CommandBuffer cmdbuf) {
+            cmdbuf.DrawIndexed(index_count, instance_count, first_index, vertex_offset,
+                               first_instance);
+        });
+        return;
+    }
+    pending.kind = PendingDraws::Kind::DrawIndexed;
+    pending.instance_count = instance_count;
+    pending.first_instance = first_instance;
+    pending.indexed_draws.push_back(
+        {.firstIndex = first_index, .indexCount = index_count, .vertexOffset = vertex_offset});
+}
+
+void Scheduler::RecordDrawIndirect(bool mergeable, bool indexed, VkBuffer buffer,
+                                   VkDeviceSize offset, u32 stride) {
+    auto& pending = pending_draws;
+    const auto kind = indexed ? PendingDraws::Kind::IndirectIndexed : PendingDraws::Kind::Indirect;
+    if (pending.kind == kind && mergeable && multi_draw_indirect && pending.buffer == buffer &&
+        pending.stride == stride &&
+        offset == pending.offset + VkDeviceSize{pending.indirect_count} * stride &&
+        pending.indirect_count < MaxMergedDraws) {
+        ++pending.indirect_count;
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::MergedDraws, 1);
+        return;
+    }
+    FlushPendingDraws();
+    if (!merge_draws || !mergeable || !multi_draw_indirect) {
+        Record([indexed, buffer, offset, stride](vk::CommandBuffer cmdbuf) {
+            if (indexed) {
+                cmdbuf.DrawIndexedIndirect(buffer, offset, 1, stride);
+            } else {
+                cmdbuf.DrawIndirect(buffer, offset, 1, stride);
+            }
+        });
+        return;
+    }
+    pending.kind = kind;
+    pending.buffer = buffer;
+    pending.offset = offset;
+    pending.stride = stride;
+    pending.indirect_count = 1;
+}
+
+void Scheduler::FlushPendingDraws() {
+    auto& pending = pending_draws;
+    const auto kind = std::exchange(pending.kind, PendingDraws::Kind::None);
+    switch (kind) {
+    case PendingDraws::Kind::None:
+        return;
+    case PendingDraws::Kind::Draw: {
+        std::vector<VkMultiDrawInfoEXT> draws(pending.draws.begin(), pending.draws.end());
+        pending.draws.clear();
+        Record([draws = std::move(draws), instances = pending.instance_count,
+                first_instance = pending.first_instance,
+                multi = multi_draw](vk::CommandBuffer cmdbuf) {
+            if (draws.size() > 1 && multi) {
+                cmdbuf.DrawMultiEXT(draws, instances, first_instance);
+                return;
+            }
+            for (const VkMultiDrawInfoEXT& draw : draws) {
+                cmdbuf.Draw(draw.vertexCount, instances, draw.firstVertex, first_instance);
+            }
+        });
+        return;
+    }
+    case PendingDraws::Kind::DrawIndexed: {
+        std::vector<VkMultiDrawIndexedInfoEXT> draws(pending.indexed_draws.begin(),
+                                                     pending.indexed_draws.end());
+        pending.indexed_draws.clear();
+        Record([draws = std::move(draws), instances = pending.instance_count,
+                first_instance = pending.first_instance,
+                multi = multi_draw](vk::CommandBuffer cmdbuf) {
+            if (draws.size() > 1 && multi) {
+                cmdbuf.DrawMultiIndexedEXT(draws, instances, first_instance);
+                return;
+            }
+            for (const VkMultiDrawIndexedInfoEXT& draw : draws) {
+                cmdbuf.DrawIndexed(draw.indexCount, instances, draw.firstIndex,
+                                   draw.vertexOffset, first_instance);
+            }
+        });
+        return;
+    }
+    case PendingDraws::Kind::Indirect:
+    case PendingDraws::Kind::IndirectIndexed:
+        Record([indexed = kind == PendingDraws::Kind::IndirectIndexed, buffer = pending.buffer,
+                offset = pending.offset, count = pending.indirect_count,
+                stride = pending.stride](vk::CommandBuffer cmdbuf) {
+            if (indexed) {
+                cmdbuf.DrawIndexedIndirect(buffer, offset, count, stride);
+            } else {
+                cmdbuf.DrawIndirect(buffer, offset, count, stride);
+            }
+        });
+        return;
+    }
+}
 
 u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
@@ -151,6 +299,7 @@ void Scheduler::DispatchWork(bool force_wake) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
+    FlushPendingDraws();
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
@@ -425,6 +574,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+    FlushPendingDraws();
     EndPendingOperations();
     InvalidateState();
 

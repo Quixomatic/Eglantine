@@ -164,6 +164,15 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
+public:
+    /// Whether a stage reads the draw index builtin (gl_DrawID): its draws are never merged.
+    [[nodiscard]] bool ReadsDrawIndex() const noexcept {
+        return reads_draw_index;
+    }
+
+private:
+    bool reads_draw_index{};
+
     /// Bindless: pushes the slot table's descriptor (the table's stage, in its texture slot).
     void PushBindlessTable(size_t stage);
 
@@ -209,6 +218,13 @@ private:
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    /// What the last recorded draw of this pipeline bound (C: an identical next draw records
+    /// nothing while that draw is still pending in the scheduler).
+    std::vector<DescriptorUpdateEntry> recorded_payload;
+    std::remove_cvref_t<decltype(std::declval<RescalingPushConstant>().Data())> recorded_rescaling{};
+    std::array<f32, 4> recorded_render_area{};
+    bool recorded_render_area_used{};
+    VkDeviceSize recorded_offset{};
 
     /// Binding cache, texture side: the last full resolution's image views and samplers and the
     /// values they came from (each handle word and its 32-byte TIC and TSC entries), with host

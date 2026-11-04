@@ -7,6 +7,28 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.28] - 2026-11-04
+
+Draw merging (plan C): consecutive draws of identical state are recorded as one multi-draw, and a
+draw that binds exactly what the previous draw of its pipeline bound records no bindings. Built for
+games that issue runs of identical-state draws (UI, text, particles, foliage); Donkey Kong Bananza's
+draws each bring their own geometry, uniforms and base instance, so it merges none (bindings skipped
+for ~2.7k draws a second), rendering unchanged (baseline 0.951).
+
+### Added
+- **Draw merging in the scheduler** (`Scheduler::RecordDraw`, `RecordDrawIndexed`,
+  `RecordDrawIndirect`): a draw is held back while the next one may join it. It joins when nothing
+  else was recorded in between (every other command records the held batch first, so nothing is
+  reordered) and it draws the same way: same kind, instance count and first instance; indirect draws
+  also read the record right after the batch's. A batch is recorded as one `vkCmdDrawMultiEXT` /
+  `vkCmdDrawMultiIndexedEXT` (VK_EXT_multi_draw, now enabled when present) or multi-draw indirect
+  call, or a loop of draws without them. Pipelines whose shaders read the draw index, and draws with
+  transform feedback, are never merged. `EDEN_NX2_MERGE_DRAWS=0` turns it off.
+- **Unchanged bindings record nothing**: while the previous draw of the same pipeline is still held
+  (so nothing was recorded since), a draw whose descriptors, push constants, rescaling and descriptor
+  buffer offset match it skips `ConfigureDraw`'s binding commands entirely.
+- Profiler counters `merged_draws`, `skipped_bindings`.
+
 ## [0.1.27] - 2026-11-04
 
 Batching (plan C), first piece: a draw whose pipeline state did not change reuses the previous

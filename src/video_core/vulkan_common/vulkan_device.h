@@ -69,7 +69,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
-    FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
+    FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                                 FEATURE(EXT, MultiDraw, MULTI_DRAW, multi_draw)                                                \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
@@ -962,6 +962,16 @@ FN_MAX_LIMIT_LIST
 
     bool IsExtAstcDecodeModeSupported() const {
         return extensions.astc_decode_mode;
+    }
+
+    /// Returns true if the device draws several ranges in one command (VK_EXT_multi_draw).
+    bool IsExtMultiDrawSupported() const {
+        return extensions.multi_draw && features.multi_draw.multiDraw;
+    }
+
+    /// Returns true if indirect draws can read several records (multiDrawIndirect).
+    bool IsMultiDrawIndirectSupported() const {
+        return features.features.multiDrawIndirect;
     }
 
     /// Returns true if descriptor bindings is partially bound.
