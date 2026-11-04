@@ -1211,7 +1211,13 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         bool is_rect_sample{false};
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageQueryDimensions:
-            flags.type.Assign(ReadTextureTypeCached(env, cbuf));
+            // TextureInstInfo::type has 3 bits: Color2DRect (8) would wrap to Color1D. A
+            // rectangle texture is a 2D view (only its coordinates are unnormalized), so query
+            // it as one; the host never creates a separate Color2DRect view either.
+            flags.type.Assign([&] {
+                const TextureType tic_type{ReadTextureTypeCached(env, cbuf)};
+                return tic_type == TextureType::Color2DRect ? TextureType::Color2D : tic_type;
+            }());
             inst->SetFlags(flags);
             break;
         case IR::Opcode::ImageSampleImplicitLod:

@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.26] - 2026-11-04
+
+Two shader recompiler bugs found while researching bindless textures.
+
+### Fixed
+- **The render area push constant overwrote the texture rescaling bits.** Both were declared at
+  push constant offset 0, and the render area (pushed after the rescaling words) replaced the
+  first 16 bytes of them, so a shader using the render area read garbage rescaling bits for its
+  textures; a shader using both also had two push constant blocks, which Vulkan does not allow.
+  The render area now lives at offset 32, after the rescaling layout (the pipeline's push constant
+  range already covered it), and is a member of the rescaling block when a shader uses both.
+- **Rectangle textures queried as 1D.** The texture type field of a texture instruction has 3 bits,
+  so a TIC entry of type Color2DRect (8) assigned for a size query wrapped to Color1D; it is
+  recorded as Color2D (a rectangle texture is a 2D view with unnormalized coordinates).
+
+### Internal
+- Known, not fixed (cannot be tested here): without robustness2 `nullDescriptor`, the fallback null
+  image views are all 1D views whatever the binding's dimension.
+
 ## [0.1.25] - 2026-11-04
 
 Bindless follow-up and a descriptor path diagnostic. Bindless stays off by default: on Donkey Kong
