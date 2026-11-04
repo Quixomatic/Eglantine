@@ -7,6 +7,13 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.13] - 2026-11-04
+
+### Internal
+- `uniform_stream_reuse.h` documents why each slot keeps a CPU copy of its bytes: comparing against
+  the stream allocation instead reads write-combined upload memory, which took Donkey Kong Bananza
+  to 1.7 fps when tried (reverted).
+
 ## [0.1.12] - 2026-11-04
 
 ### Added

@@ -51,6 +51,8 @@ public:
         Ref ref{};
         u64 tick{};
         u32 size{}; // 0: nothing streamed yet
+        // A CPU copy on purpose: the stream allocation is upload (write-combined) memory, and
+        // comparing against it instead made reads so slow DK Bananza ran at 1.7 fps.
         std::array<u8, MaxBytes> bytes{};
     };
 
