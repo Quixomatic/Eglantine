@@ -7,6 +7,28 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.24] - 2026-11-04
+
+Bindless textures work end to end (still off by default: `EDEN_NX2_BINDLESS=1`). Donkey Kong
+Bananza renders correctly through the texture heap (baseline 0.946) at 24.5 fps on the open map,
+against 25.0 with the classic path; tuning comes next.
+
+### Added
+- **Bindless graphics pipelines.** A graphics pipeline whose textures fit the slot table (at most
+  4096 texture elements, no task/mesh stages; `UsesBindlessTextures`, decided the same way by the
+  pipeline cache and the pipeline) samples them from the heap:
+  - Shaders (`Profile::bindless_textures`): the module's own resources move to descriptor set 1;
+    the heap's per-class image arrays and its sampler array are runtime arrays in set 0; textures
+    are loaded through a slot table UBO (`uvec4 words[1024]`, one word per texture element: image
+    slot | sampler slot << 18) declared where the first textured stage's textures were bound, with
+    NonUniform decorations when the element index is dynamic.
+  - Pipelines: layout {heap, own set}; the own set has the slot table instead of texture bindings
+    (push descriptors or pooled sets at set 1; descriptor buffers are not used for these); the heap
+    is bound whenever the pipeline is.
+  - Draws: the slot table is built from the resolved views and samplers (`BuildBindlessTable`;
+    reused on binding cache hits) and uploaded through the uniform stream, or the previous upload
+    is bound again when the words and command buffer are the same.
+
 ## [0.1.23] - 2026-11-04
 
 Groundwork for bindless textures (inactive unless `EDEN_NX2_BINDLESS=1`; nothing samples from the

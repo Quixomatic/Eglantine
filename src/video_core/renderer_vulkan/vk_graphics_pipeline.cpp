@@ -68,8 +68,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    VkDescriptorSetLayout bindless_heap_layout = VK_NULL_HANDLE) {
     DescriptorLayoutBuilder builder{device};
+    if (bindless_heap_layout != VK_NULL_HANDLE) {
+        builder.SetBindless(bindless_heap_layout);
+    }
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
@@ -297,9 +301,26 @@ GraphicsPipeline::GraphicsPipeline(
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    // Bindless textures: the same decision the pipeline cache made when it emitted the shaders.
+    TextureHeap* const heap{texture_cache.GetRuntime().texture_heap.get()};
+    if (UsesBindlessTextures(heap != nullptr, infos)) {
+        texture_heap = heap;
+        // One slot table entry replaces every texture element.
+        num_descriptor_entries = num_descriptor_entries - num_textures + 1;
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (infos[stage] && !infos[stage]->texture_descriptors.empty()) {
+                bindless_table_stage = stage;
+                break;
+            }
+        }
+    }
+
+    DescriptorLayoutBuilder builder{
+        MakeBuilder(device, stage_infos, texture_heap ? texture_heap->Layout() : VK_NULL_HANDLE)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    // The heap is a classic descriptor set, which descriptor buffer pipelines cannot bind.
+    uses_descriptor_buffer = !texture_heap && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -321,8 +342,20 @@ GraphicsPipeline::GraphicsPipeline(
         descriptor_update_template =
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor) {
-            descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+            if (texture_heap) {
+                // Pool sizes for the bindless set: no textures, one slot table UBO.
+                std::array<Shader::Info, NUM_STAGES> bank_infos{stage_infos};
+                for (Shader::Info& info : bank_infos) {
+                    info.texture_descriptors.clear();
+                }
+                bank_infos[bindless_table_stage].constant_buffer_descriptors.push_back(
+                    Shader::ConstantBufferDescriptor{.index = 0, .count = 1});
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos);
+            } else {
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+            }
         }
     }
 
@@ -651,8 +684,23 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const char* value = std::getenv("EDEN_NX2_BINDCACHE_ENTRIES");
         return value == nullptr || value[0] != '0';
     }();
-    const bool reuse_entries = entries_enabled && texture_hit && tbc.entries_valid;
-    const bool record_entries = entries_enabled && texture_cache_on && !reuse_entries;
+    // Bindless pipelines push a slot table instead of texture descriptors (texture_heap).
+    const bool reuse_entries = entries_enabled && !texture_heap && texture_hit && tbc.entries_valid;
+    const bool record_entries =
+        entries_enabled && !texture_heap && texture_cache_on && !reuse_entries;
+    if (texture_heap) {
+        // The words depend only on the views and samplers (a view keeps its heap slots while it
+        // lives; deletion and rescaling invalidate the binding cache), so a hit reuses them.
+        if (!texture_hit || !bindless_words_valid) {
+            BuildBindlessTable(texture_cache, *texture_heap, stage_infos,
+                               std::span<const VideoCommon::ImageViewInOut>{views.data(),
+                                                                            views.size()},
+                               std::span<const VideoCommon::SamplerId>{samplers.data(),
+                                                                       samplers.size()},
+                               bindless_words, bindless_rescaled);
+        }
+        bindless_words_valid = texture_cache_on;
+    }
     if (record_entries) {
         tbc.image_entries.clear();
         tbc.rescaled.clear();
@@ -784,6 +832,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    const u8* rescaled_it{bindless_rescaled.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -793,7 +842,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             // Cached pipelines have plain sampled textures only (texture_cacheable_spec).
             const Shader::Info& stage_info{stage_infos[stage]};
-            if (reuse_entries) {
+            if (texture_heap) {
+                PushBindlessImageDescriptors(
+                    texture_cache, guest_descriptor_queue, stage_info, rescaling, samplers_it,
+                    views_it, rescaled_it, [&] {
+                        if (stage == bindless_table_stage) {
+                            PushBindlessTable(stage);
+                        }
+                    });
+            } else if (reuse_entries) {
                 for (const auto& desc : stage_info.texture_descriptors) {
                     for (u32 index = 0; index < desc.count; ++index) {
                         const auto& [image_view, sampler] = tbc.image_entries[entry_pos++];
@@ -874,6 +931,26 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+void GraphicsPipeline::PushBindlessTable(size_t stage) {
+    // A UBO of uvec4: four words per vector, the last one zero padded.
+    const u32 num_vectors{static_cast<u32>((bindless_words.size() + 3) / 4)};
+    const u32 size{num_vectors * 16};
+    auto& runtime{buffer_cache.runtime};
+    if (bindless_upload_tick == runtime.CurrentTick() && bindless_uploaded_words == bindless_words) {
+        // The same words in the same command buffer: bind the previous upload again.
+        runtime.RebindStreamUniform(bindless_upload_ref, size);
+        return;
+    }
+    const std::span<u8> span{runtime.BindMappedUniformBuffer(stage, 0, size)};
+    std::memcpy(span.data(), bindless_words.data(), bindless_words.size() * sizeof(u32));
+    std::memset(span.data() + bindless_words.size() * sizeof(u32), 0,
+                size - bindless_words.size() * sizeof(u32));
+    bindless_upload_ref = runtime.LastStreamUniformRef();
+    // After the allocation: the tick its stream region belongs to.
+    bindless_upload_tick = runtime.CurrentTick();
+    bindless_uploaded_words = bindless_words;
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -958,6 +1035,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            if (texture_heap) {
+                // The heap is set 0 of every bindless layout: switching between bindless
+                // pipelines keeps it; anything else bound in between makes this pipeline rebind.
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                          Shader::Bindless::kHeapSet, texture_heap->Set(),
+                                          nullptr);
+            }
         }
         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
@@ -977,19 +1061,20 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!descriptor_set_layout) {
             return;
         }
+        const u32 resource_set{texture_heap ? Shader::Bindless::kResourceSet : 0U};
         if (uses_descriptor_buffer) {
             const u32 buffer_index{};
             cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
                                                  0, buffer_index, descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
+                                                    resource_set, descriptor_data);
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};
             dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                      descriptor_set, nullptr);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                      resource_set, descriptor_set, nullptr);
         }
     });
     return true;

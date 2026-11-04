@@ -164,6 +164,9 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
+    /// Bindless: pushes the slot table's descriptor (the table's stage, in its texture slot).
+    void PushBindlessTable(size_t stage);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
@@ -238,6 +241,18 @@ private:
         std::vector<u8> rescaled;
     };
     TextureBindingCache texture_binding_cache;
+
+    /// Bindless textures (see .plans/bindless-design.md): the heap, null when this pipeline binds
+    /// its textures the classic way; the stage whose texture slot holds the slot table; the table
+    /// words of the last draw and the stream allocation they were uploaded to.
+    TextureHeap* texture_heap{};
+    size_t bindless_table_stage{};
+    std::vector<u32> bindless_words;
+    std::vector<u8> bindless_rescaled;
+    bool bindless_words_valid{};
+    std::vector<u32> bindless_uploaded_words;
+    BufferCacheRuntime::StreamUniformRef bindless_upload_ref{};
+    u64 bindless_upload_tick{~0ULL};
     /// -1 not computed, 0 no, 1 yes: only plain sampled textures with constant buffer handles.
     s8 texture_cache_eligible{-1};
     VkDeviceSize last_descriptor_buffer_offset{};

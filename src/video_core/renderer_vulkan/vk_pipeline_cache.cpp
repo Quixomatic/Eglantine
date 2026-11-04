@@ -1444,6 +1444,23 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     auto modules{std::make_shared<GraphicsShaderModules>()};
 
+    // Bindless textures are decided per pipeline from its stages (UsesBindlessTextures, which
+    // GraphicsPipeline repeats with the same infos), and every stage is emitted for it.
+    Shader::Profile pipeline_profile{profile};
+    {
+        std::array<const Shader::Info*, Maxwell::MaxShaderStage> stage_infos{};
+        for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+             index < Maxwell::MaxShaderProgram; ++index) {
+            const bool is_emulated_stage = layer_source_program != nullptr &&
+                                           index == static_cast<u32>(Maxwell::ShaderType::Geometry);
+            if (index != 0 && (key.unique_hashes[index] != 0 || is_emulated_stage)) {
+                stage_infos[index - 1] = &programs[index].info;
+            }
+        }
+        pipeline_profile.bindless_textures =
+            UsesBindlessTextures(device.IsBindlessTexturesEnabled(), stage_infos);
+    }
+
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
@@ -1465,7 +1482,7 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
         {
             const PipelineStats::ScopedTimer emit_timer{PipelineStats::Kind::Graphics,
                                                         PipelineStats::Stage::Emit};
-            code = EmitSPIRV(profile, runtime_info, program, binding);
+            code = EmitSPIRV(pipeline_profile, runtime_info, program, binding);
         }
         device.SaveShader(code);
         {

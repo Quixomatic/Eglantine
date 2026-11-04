@@ -258,6 +258,11 @@ public:
     /// re-bound or invalidated (image deletion). The binding cache keys on it.
     u64 binding_cache_serial = 1;
 
+    /// The backend's runtime (the Vulkan one owns the bindless texture heap).
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
+    }
+
     /// Return a constant reference to the given sampler id
     [[nodiscard]] const Sampler& GetSampler(SamplerId id) const noexcept;
 

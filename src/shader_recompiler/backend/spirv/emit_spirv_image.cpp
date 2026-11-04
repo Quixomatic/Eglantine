@@ -7,6 +7,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/bindless.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/modifiers.h"
@@ -238,8 +239,69 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+/// Bindless: the image (and sampler) of a texture element, from the heap through the slot table.
+struct BindlessTexture {
+    Id image;
+    Id sampler;
+    bool non_uniform;
+};
+
+BindlessTexture LoadBindless(EmitContext& ctx, const TextureDefinition& def, const IR::Value& index,
+                             bool with_sampler) {
+    Id word_pointer;
+    bool non_uniform{false};
+    if (def.count == 1 || index.IsEmpty() || index.IsImmediate()) {
+        const u32 element{def.element_base + (def.count > 1 && !index.IsEmpty() ? index.U32() : 0)};
+        word_pointer = ctx.OpAccessChain(ctx.bindless_table_word_pointer, ctx.bindless_table,
+                                         ctx.u32_zero_value, ctx.Const(element >> 2),
+                                         ctx.Const(element & 3));
+    } else {
+        // A dynamic element: its slots may differ between invocations.
+        const Id element{ctx.OpIAdd(ctx.U32[1], ctx.Const(def.element_base), ctx.Def(index))};
+        const Id vector{ctx.OpShiftRightLogical(ctx.U32[1], element, ctx.Const(2U))};
+        const Id component{ctx.OpBitwiseAnd(ctx.U32[1], element, ctx.Const(3U))};
+        word_pointer = ctx.OpAccessChain(ctx.bindless_table_word_pointer, ctx.bindless_table,
+                                         ctx.u32_zero_value, vector, component);
+        non_uniform = IsNonUniformSupported(ctx.profile, NonUniformKind::SampledImage);
+    }
+    const Id word{ctx.OpLoad(ctx.U32[1], word_pointer)};
+    const Id image_slot{ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.Const(Bindless::kImageSlotMask))};
+    const Id image_pointer{ctx.OpAccessChain(ctx.bindless_image_pointers[def.image_class],
+                                             ctx.bindless_images[def.image_class], image_slot)};
+    const Id image{ctx.OpLoad(def.image_type, image_pointer)};
+    Id sampler{};
+    Id sampler_pointer{};
+    Id sampler_slot{};
+    if (with_sampler) {
+        sampler_slot = ctx.OpShiftRightLogical(ctx.U32[1], word, ctx.Const(Bindless::kImageSlotBits));
+        sampler_pointer = ctx.OpAccessChain(ctx.bindless_sampler_pointer, ctx.bindless_samplers,
+                                            sampler_slot);
+        sampler = ctx.OpLoad(ctx.bindless_sampler_type, sampler_pointer);
+    }
+    if (non_uniform) {
+        ctx.uses_nonuniform_sampled_image = true;
+        for (const Id id : {image_slot, image_pointer, image}) {
+            DecorateNonUniform(ctx, id);
+        }
+        if (with_sampler) {
+            for (const Id id : {sampler_slot, sampler_pointer, sampler}) {
+                DecorateNonUniform(ctx, id);
+            }
+        }
+    }
+    return {image, sampler, non_uniform};
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (ctx.profile.bindless_textures) {
+        const BindlessTexture texture{LoadBindless(ctx, def, index, true)};
+        const Id sampled{ctx.OpSampledImage(def.sampled_type, texture.image, texture.sampler)};
+        if (texture.non_uniform) {
+            DecorateNonUniform(ctx, sampled);
+        }
+        return sampled;
+    }
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -273,6 +335,9 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        if (ctx.profile.bindless_textures) {
+            return LoadBindless(ctx, def, index, false).image;
+        }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
