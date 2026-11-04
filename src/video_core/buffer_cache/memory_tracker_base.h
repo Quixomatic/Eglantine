@@ -159,6 +159,20 @@ public:
         });
     }
 
+    /// The CPU-modification epoch of the region holding the whole range; 0 (never a valid epoch)
+    /// when the range spans regions or its region does not exist yet.
+    [[nodiscard]] u64 CpuEpoch(VAddr cpu_addr, u64 size) const noexcept {
+        if (size == 0) {
+            return 0;
+        }
+        const size_t first = cpu_addr >> HIGHER_PAGE_BITS;
+        if (first != ((cpu_addr + size - 1) >> HIGHER_PAGE_BITS) || first >= NUM_HIGH_PAGES) {
+            return 0;
+        }
+        const Manager* const manager = top_tier[first];
+        return manager != nullptr ? manager->cpu_epoch : 0;
+    }
+
 private:
     template <bool create_region_on_fail, typename Func>
     bool IteratePages(VAddr cpu_address, size_t size, Func&& func) {
@@ -250,6 +264,7 @@ private:
         }
         Manager* new_manager = free_managers.front();
         new_manager->cpu_addr = base_cpu_address;
+        new_manager->cpu_epoch = Manager::NextCpuEpoch();
         free_managers.pop_front();
         return new_manager;
     }

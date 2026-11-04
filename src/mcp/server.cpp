@@ -57,9 +57,10 @@ constexpr const char* kInstructions =
     "(exec/read/write watchpoints through the emulator's GDB stub; hits are 'break' events with "
     "backtraces). For rendering bugs: dump_set/dump_list/dump_read (shader and macro dumps). "
     "For crashes: report_list/report_read (with reporting_services on). To measure what a "
-    "setting does: ab_test. State-changing tools need MCP writes (Tools > MCP Server > Allow "
-    "Writes) and the control lease, granted automatically when no other agent holds it. Timing "
-    "is not cycle-accurate: compare runs with tolerance.";
+    "setting does: ab_test. Booting, pausing, stopping and quitting need only the control lease, "
+    "granted automatically when no other agent holds it; writes (input, memory, settings, "
+    "breakpoints) also need MCP writes (Tools > MCP Server > Allow Writes). Full tool reference: "
+    "docs/MCP-tools.md. Timing is not cycle-accurate: compare runs with tolerance.";
 
 /// Keys must never reach an agent: in lines that mention a key, hex runs of 32+ digits (key or
 /// key-derived material) are replaced.

@@ -31,7 +31,11 @@ struct RenderAreaLayout {
 };
 constexpr u32 RESCALING_LAYOUT_WORDS_OFFSET = offsetof(RescalingLayout, rescaling_textures);
 constexpr u32 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET = offsetof(RescalingLayout, down_factor);
-constexpr u32 RENDERAREA_LAYOUT_OFFSET = offsetof(RenderAreaLayout, render_area);
+// The render area follows the rescaling words in the same push constant range (a shader may use
+// one push constant block only: when it uses both, they are members of one block).
+constexpr u32 RENDERAREA_LAYOUT_OFFSET =
+    static_cast<u32>(sizeof(RescalingLayout)) + offsetof(RenderAreaLayout, render_area);
+static_assert(sizeof(RescalingLayout) == 32);
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {

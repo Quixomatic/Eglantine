@@ -15,8 +15,10 @@
 
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/bindless.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -53,6 +55,31 @@ Id ImageType(EmitContext& ctx, const TextureDescriptor& desc) {
         break;
     }
     throw InvalidArgument("Invalid texture type {}", desc.type);
+}
+
+/// The image type of a bindless heap class (Bindless::ClassInfoOf).
+Id BindlessImageType(EmitContext& ctx, const Bindless::ClassInfo& info) {
+    const spv::ImageFormat format{spv::ImageFormat::Unknown};
+    const Id type{info.is_integer ? ctx.U32[1] : ctx.F32[1]};
+    const bool depth{info.is_depth};
+    const bool ms{info.is_multisample};
+    switch (info.dim) {
+    case Bindless::Dim::D1:
+        return ctx.TypeImage(type, spv::Dim::Dim1D, depth, false, false, 1, format);
+    case Bindless::Dim::D1Array:
+        return ctx.TypeImage(type, spv::Dim::Dim1D, depth, true, false, 1, format);
+    case Bindless::Dim::D2:
+        return ctx.TypeImage(type, spv::Dim::Dim2D, depth, false, ms, 1, format);
+    case Bindless::Dim::D2Array:
+        return ctx.TypeImage(type, spv::Dim::Dim2D, depth, true, ms, 1, format);
+    case Bindless::Dim::D3:
+        return ctx.TypeImage(type, spv::Dim::Dim3D, depth, false, false, 1, format);
+    case Bindless::Dim::Cube:
+        return ctx.TypeImage(type, spv::Dim::Cube, depth, false, false, 1, format);
+    case Bindless::Dim::CubeArray:
+        return ctx.TypeImage(type, spv::Dim::Cube, depth, true, false, 1, format);
+    }
+    throw InvalidArgument("Invalid bindless image class dimension");
 }
 
 spv::ImageFormat GetImageFormat(ImageFormat format) {
@@ -290,7 +317,7 @@ void DefineConstBuffers(EmitContext& ctx, const Info& info, Id UniformDefinition
     for (const ConstantBufferDescriptor& desc : info.constant_buffer_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer_type, spv::StorageClass::Uniform)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("c{}", desc.index));
         for (size_t i = 0; i < desc.count; ++i) {
             ctx.cbufs[desc.index + i].*member_type = id;
@@ -320,7 +347,7 @@ void DefineSsbos(EmitContext& ctx, StorageTypeDefinition& type_def,
     for (const StorageBufferDescriptor& desc : info.storage_buffers_descriptors) {
         const Id id{ctx.AddGlobalVariable(struct_pointer, spv::StorageClass::StorageBuffer)};
         ctx.Decorate(id, spv::Decoration::Binding, binding);
-        ctx.Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        ctx.Decorate(id, spv::Decoration::DescriptorSet, ctx.descriptor_set);
         ctx.Name(id, fmt::format("ssbo{}", index));
         if (ctx.profile.supported_spirv >= 0x00010400) {
             ctx.interfaces.push_back(id);
@@ -475,6 +502,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     u32& storage_binding{is_unified ? bindings.unified : bindings.storage_buffer};
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
     u32& image_binding{is_unified ? bindings.unified : bindings.image};
+    descriptor_set = profile.bindless_textures ? Bindless::kResourceSet : 0U;
     AddCapability(spv::Capability::Shader);
     DefineCommonTypes(program.info);
     DefineCommonConstants();
@@ -488,7 +516,11 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineStorageBuffers(program.info, storage_binding);
     DefineTextureBuffers(program.info, texture_binding);
     DefineImageBuffers(program.info, image_binding);
-    DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
+    if (profile.bindless_textures) {
+        DefineBindlessTextures(program.info, texture_binding, bindings);
+    } else {
+        DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
+    }
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
@@ -895,10 +927,13 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
 }
 
 void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
-    if (profile.support_int8 && profile.support_int16) {
-        return;
-    }
-    if (!info.uses_int8 && !info.uses_int16) {
+    // Must match the conditions in EmitWriteStorage{U,S}{8,16}: the CAS loop is also used when
+    // storage buffer 8/16-bit access or descriptor aliasing is unavailable (e.g. Qualcomm).
+    const bool direct_int8{profile.support_int8 && profile.support_storage_buffer_8bit &&
+                           profile.support_descriptor_aliasing};
+    const bool direct_int16{profile.support_int16 && profile.support_storage_buffer_16bit &&
+                            profile.support_descriptor_aliasing};
+    if ((direct_int8 || !info.uses_int8) && (direct_int16 || !info.uses_int16)) {
         return;
     }
 
@@ -954,25 +989,16 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                                auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
-        for (size_t index = 0; index < num_buffers; ++index) {
-            if (!info.nvn_buffer_used[index]) {
-                continue;
-            }
+        const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+        const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_addr_cbuf_offset{Const(ssbo.cbuf_offset / 8)};
-            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
-            const Id ssbo_addr_pointer{OpAccessChain(
-                uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, zero, ssbo_addr_cbuf_offset)};
-            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
-                                                     zero, ssbo_size_cbuf_offset)};
-
-            const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
+            const Id ssbo_addr_pointer{OpAccessChain(uniform_types.U32x2,
+                                                     cbufs[ssbo.cbuf_index].U32x2, zero,
+                                                     Const(ssbo.cbuf_offset / 8))};
             const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
-            const Id ssbo_addr{OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask))};
-            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
-            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
-            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
-                                       OpULessThan(U1, addr, ssbo_end))};
+            return OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask));
+        }};
+        const auto access{[&](size_t index, Id ssbo_addr, Id cond) {
             const Id then_label{OpLabel()};
             const Id else_label{OpLabel()};
             OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
@@ -984,6 +1010,41 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
             callback(ssbo_pointer);
             AddLabel(else_label);
+        }};
+        if (info.native_global_bounds) {
+            // Native pointers carry no NVN size word. The address belongs to the candidate buffer
+            // whose base is the closest one at or below it (bounds come from the binding).
+            std::vector<Id> bases(num_buffers);
+            Id best_index{Const(~0U)};
+            Id best_distance{Constant(U64, ~u64{0})};
+            for (size_t index = 0; index < num_buffers; ++index) {
+                bases[index] = base_address(index);
+                const Id distance{OpISub(U64, addr, bases[index])};
+                const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
+                                             OpULessThan(U1, distance, best_distance))};
+                best_distance = OpSelect(U64, better, distance, best_distance);
+                best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
+            }
+            for (size_t index = 0; index < num_buffers; ++index) {
+                access(index, bases[index],
+                       OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
+            }
+            return;
+        }
+        for (size_t index = 0; index < num_buffers; ++index) {
+            if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+                continue;
+            }
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
+            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
+                                                     zero, ssbo_size_cbuf_offset)};
+            const Id ssbo_addr{base_address(index)};
+            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
+            const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
+            const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
+                                       OpULessThan(U1, addr, ssbo_end))};
+            access(index, ssbo_addr, cond);
         }
     }};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
@@ -1030,14 +1091,14 @@ void EmitContext::DefineRescalingInput(const Info& info) {
         return;
     }
     if (profile.unified_descriptor_binding) {
-        DefineRescalingInputPushConstant();
+        DefineRescalingInputPushConstant(info);
     } else {
         DefineRescalingInputUniformConstant();
     }
 }
 
-void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 3> members{};
+void EmitContext::DefineRescalingInputPushConstant(const Info& info) {
+    boost::container::static_vector<Id, 4> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1054,9 +1115,20 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(F32[1]);
         rescaling_downfactor_member_index = member_index++;
     }
+    // The render area shares this block when the shader uses both.
+    const bool with_render_area{info.uses_render_area && stage != Stage::Compute};
+    if (with_render_area) {
+        members.push_back(F32[4]);
+        render_are_member_index = member_index++;
+    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
+    if (with_render_area) {
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
+        MemberName(push_constant_struct, render_are_member_index, "render_area");
+    }
 
     MemberDecorate(push_constant_struct, rescaling_textures_member_index, spv::Decoration::Offset,
                    static_cast<u32>(offsetof(RescalingLayout, rescaling_textures)));
@@ -1075,6 +1147,9 @@ void EmitContext::DefineRescalingInputPushConstant() {
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
+    if (with_render_area) {
+        render_area_push_constant = rescaling_push_constants;
+    }
 
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
@@ -1093,7 +1168,8 @@ void EmitContext::DefineRescalingInputUniformConstant() {
 }
 
 void EmitContext::DefineRenderArea(const Info& info) {
-    if (!info.uses_render_area) {
+    if (!info.uses_render_area || render_area_push_constant.value != 0) {
+        // Not used, or a member of the rescaling block (DefineRescalingInputPushConstant).
         return;
     }
 
@@ -1108,7 +1184,8 @@ void EmitContext::DefineRenderArea(const Info& info) {
         Decorate(push_constant_struct, spv::Decoration::Block);
         Name(push_constant_struct, "RenderAreaInfo");
 
-        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
+        MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset,
+                       RENDERAREA_LAYOUT_OFFSET);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
 
         const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
@@ -1339,7 +1416,7 @@ void EmitContext::DefineTextureBuffers(const Info& info, u32& binding) {
         }
         const Id id{AddGlobalVariable(type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "texbuf"));
         texture_buffers.push_back({
             .id = id,
@@ -1362,7 +1439,7 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "imgbuf"));
         image_buffers.push_back({
             .id = id,
@@ -1387,7 +1464,7 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "tex"));
         textures.push_back({
             .id = id,
@@ -1409,6 +1486,89 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
+Id EmitContext::BindlessHeapArray(u32 image_class, Id image_type) {
+    Id& variable = bindless_images[image_class];
+    if (variable.value != 0) {
+        return variable;
+    }
+    const Id array_type{TypeRuntimeArray(image_type)};
+    const Id pointer{TypePointer(spv::StorageClass::UniformConstant, array_type)};
+    variable = AddGlobalVariable(pointer, spv::StorageClass::UniformConstant);
+    Decorate(variable, spv::Decoration::Binding, image_class);
+    Decorate(variable, spv::Decoration::DescriptorSet, Bindless::kHeapSet);
+    Name(variable, fmt::format("heap_images{}", image_class));
+    bindless_image_pointers[image_class] = TypePointer(spv::StorageClass::UniformConstant, image_type);
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(variable);
+    }
+    return variable;
+}
+
+void EmitContext::DefineBindlessTextures(const Info& info, u32& binding, Bindings& bindings) {
+    if (info.texture_descriptors.empty()) {
+        return;
+    }
+    if (profile.supported_spirv < 0x00010500) {
+        AddExtension("SPV_EXT_descriptor_indexing");
+    }
+    AddCapability(spv::Capability::RuntimeDescriptorArray);
+
+    // The slot table: one per pipeline, declared where the first stage's textures would be bound.
+    if (bindings.texture_table == ~0U) {
+        bindings.texture_table = binding++;
+    }
+    const Id words_type{TypeArray(U32[4], Const(Bindless::kTableVectors))};
+    Decorate(words_type, spv::Decoration::ArrayStride, 16U);
+    const Id block_type{TypeStruct(words_type)};
+    Decorate(block_type, spv::Decoration::Block);
+    MemberName(block_type, 0, "words");
+    MemberDecorate(block_type, 0, spv::Decoration::Offset, 0U);
+    bindless_table = AddGlobalVariable(TypePointer(spv::StorageClass::Uniform, block_type),
+                                       spv::StorageClass::Uniform);
+    Decorate(bindless_table, spv::Decoration::Binding, bindings.texture_table);
+    Decorate(bindless_table, spv::Decoration::DescriptorSet, descriptor_set);
+    Name(bindless_table, "texture_slots");
+    bindless_table_word_pointer = TypePointer(spv::StorageClass::Uniform, U32[1]);
+
+    bindless_sampler_type = TypeSampler();
+    bindless_sampler_pointer = TypePointer(spv::StorageClass::UniformConstant, bindless_sampler_type);
+    bindless_samplers = AddGlobalVariable(
+        TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(bindless_sampler_type)),
+        spv::StorageClass::UniformConstant);
+    Decorate(bindless_samplers, spv::Decoration::Binding, Bindless::kSamplerBinding);
+    Decorate(bindless_samplers, spv::Decoration::DescriptorSet, Bindless::kHeapSet);
+    Name(bindless_samplers, "heap_samplers");
+    if (profile.supported_spirv >= 0x00010400) {
+        interfaces.push_back(bindless_table);
+        interfaces.push_back(bindless_samplers);
+    }
+
+    textures.reserve(info.texture_descriptors.size());
+    for (const TextureDescriptor& desc : info.texture_descriptors) {
+        const u32 image_class{
+            Bindless::ImageClass(desc.type, desc.is_depth, desc.is_multisample, desc.is_integer)};
+        const Bindless::ClassInfo class_info{Bindless::ClassInfoOf(image_class)};
+        const Id image_type{BindlessImageType(*this, class_info)};
+        BindlessHeapArray(image_class, image_type);
+        textures.push_back({
+            .id = Id{},
+            .sampled_type = TypeSampledImage(image_type),
+            .pointer_type = bindless_image_pointers[image_class],
+            .image_type = image_type,
+            .count = desc.count,
+            .is_multisample = class_info.is_multisample,
+            .is_integer = desc.is_integer,
+            .image_class = image_class,
+            .element_base = bindings.texture_element,
+        });
+        bindings.texture_element += desc.count;
+        ++bindings.texture_scaling_index;
+    }
+    if (info.uses_atomic_image_u32) {
+        image_u32 = TypePointer(spv::StorageClass::Image, U32[1]);
+    }
+}
+
 void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
     images.reserve(info.image_descriptors.size());
     for (const ImageDescriptor& desc : info.image_descriptors) {
@@ -1417,7 +1577,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, descriptor_set);
         Name(id, NameOf(stage, desc, "img"));
         images.push_back({
             .id = id,

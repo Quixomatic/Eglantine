@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -134,6 +136,9 @@ protected:
         const u64 addr_end = addr_begin + size;
 
         const u64 page_end = addr_end >> Core::DEVICE_PAGEBITS;
+        if (!MayHaveQueries(addr_begin >> Core::DEVICE_PAGEBITS, page_end)) {
+            return;
+        }
         std::scoped_lock lock(cache_mutex);
         for (u64 page = addr_begin >> Core::DEVICE_PAGEBITS; page <= page_end; ++page) {
             const u64 page_start = page << Core::DEVICE_PAGEBITS;
@@ -178,6 +183,30 @@ protected:
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;
+
+    /// Device pages that have ever held a cached query, hashed into a bit filter that never
+    /// clears: ranges with none of their bits set skip cache_mutex (inline writes check every
+    /// write, tens of thousands a second, and almost never touch a query).
+    std::array<std::atomic<u64>, 1024> query_page_filter{};
+    static constexpr u64 QueryPageFilterBits = 1024 * 64;
+
+    void NoteQueryPage(u64 page) noexcept {
+        const u64 bit = page % QueryPageFilterBits;
+        query_page_filter[bit / 64].fetch_or(u64{1} << (bit % 64), std::memory_order_release);
+    }
+
+    [[nodiscard]] bool MayHaveQueries(u64 page_begin, u64 page_end) const noexcept {
+        if (page_end - page_begin >= QueryPageFilterBits) {
+            return true;
+        }
+        for (u64 page = page_begin; page <= page_end; ++page) {
+            const u64 bit = page % QueryPageFilterBits;
+            if ((query_page_filter[bit / 64].load(std::memory_order_acquire) >> (bit % 64)) & 1) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// Releases not written to guest memory yet (PendingRelease). Written on the GPU thread,
     /// erased by the fence that writes them.

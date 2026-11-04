@@ -68,8 +68,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
     return slot_stage;
 }
 
-DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos,
+                                    VkDescriptorSetLayout bindless_heap_layout = VK_NULL_HANDLE) {
     DescriptorLayoutBuilder builder{device};
+    if (bindless_heap_layout != VK_NULL_HANDLE) {
+        builder.SetBindless(bindless_heap_layout);
+    }
     for (size_t index = 0; index < infos.size(); ++index) {
         static constexpr std::array stages{
             VK_SHADER_STAGE_VERTEX_BIT,
@@ -296,10 +300,48 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    for (const Shader::Info& info : stage_infos) {
+        reads_draw_index |= info.loads[Shader::IR::Attribute::DrawID];
+    }
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    // Bindless textures: the same decision the pipeline cache made when it emitted the shaders.
+    TextureHeap* const heap{texture_cache.GetRuntime().texture_heap.get()};
+    if (UsesBindlessTextures(heap != nullptr, infos)) {
+        texture_heap = heap;
+        // One slot table entry replaces every texture element.
+        num_descriptor_entries = num_descriptor_entries - num_textures + 1;
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            if (infos[stage] && !infos[stage]->texture_descriptors.empty()) {
+                bindless_table_stage = stage;
+                break;
+            }
+        }
+    }
+
+    DescriptorLayoutBuilder builder{
+        MakeBuilder(device, stage_infos, texture_heap ? texture_heap->Layout() : VK_NULL_HANDLE)};
     uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    // The heap is a classic descriptor set, which descriptor buffer pipelines cannot bind.
+    uses_descriptor_buffer = !texture_heap && builder.CanUseDescriptorBuffer() &&
+                             descriptor_buffer_ring.IsValid();
+    // Diagnostics: EDEN_NX2_FORCE_SETS=1 binds every graphics pipeline with pooled descriptor
+    // sets (to compare descriptor paths); the first pipelines log which path they took.
+    static const bool force_sets = [] {
+        const char* value = std::getenv("EDEN_NX2_FORCE_SETS");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (force_sets) {
+        uses_push_descriptor = false;
+        uses_descriptor_buffer = false;
+    }
+    static std::atomic<u32> reported_paths{};
+    if (reported_paths.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LOG_INFO(Render_Vulkan, "Graphics pipeline descriptors: {}{}",
+                 uses_descriptor_buffer ? "descriptor buffer"
+                 : uses_push_descriptor ? "push descriptors"
+                                        : "pooled sets",
+                 texture_heap ? " (bindless)" : "");
+    }
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
@@ -321,8 +363,20 @@ GraphicsPipeline::GraphicsPipeline(
         descriptor_update_template =
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor) {
-            descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+            if (texture_heap) {
+                // Pool sizes for the bindless set: no textures, one slot table UBO.
+                std::array<Shader::Info, NUM_STAGES> bank_infos{stage_infos};
+                for (Shader::Info& info : bank_infos) {
+                    info.texture_descriptors.clear();
+                }
+                bank_infos[bindless_table_stage].constant_buffer_descriptors.push_back(
+                    Shader::ConstantBufferDescriptor{.index = 0, .count = 1});
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos);
+            } else {
+                descriptor_allocator =
+                    descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+            }
         }
     }
 
@@ -374,12 +428,17 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
 
 template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
-    boost::container::small_vector<VideoCommon::ImageViewInOut, 64> views;
-    boost::container::small_vector<VideoCommon::SamplerId, 64> samplers;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
     namespace Profile = VideoCommon::Nx2Profile;
+    // C (batching) measurement: uniform buffers that changed bytes during this draw.
+    const u64 uniform_copies_before{
+        Profile::Enabled() ? Profile::CounterValue(Profile::Counter::UniformCopied) : 0};
+    bool same_textures_as_last{};
+    bool same_geometry_as_last{};
     {
         Profile::Scope scope{Profile::Zone::SyncDescriptors};
         texture_cache.SynchronizeDescriptors(false);
@@ -389,6 +448,87 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+
+    // Binding cache, texture side: reuse the last resolution's image views and samplers while the
+    // handle words and the TIC/TSC entries they select compare equal (read through kept host
+    // pointers). EDEN_NX2_BINDCACHE=0 turns it off, EDEN_NX2_BINDCACHE_VERIFY=1 also resolves
+    // every hit the full way and logs differences.
+    static const bool bindcache_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BINDCACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool bindcache_verify = std::getenv("EDEN_NX2_BINDCACHE_VERIFY") != nullptr;
+    constexpr bool texture_cacheable_spec =
+        !Spec::has_images && !Spec::has_texture_buffers && !Spec::has_image_buffers;
+    if (texture_cache_eligible < 0) {
+        bool eligible = true;
+        for (const auto& info : stage_infos) {
+            for (const auto& desc : info.texture_descriptors) {
+                eligible &= desc.handle_program == ~0U && !desc.has_secondary;
+            }
+        }
+        texture_cache_eligible = eligible ? 1 : 0;
+    }
+    const bool texture_cache_on =
+        texture_cacheable_spec && texture_cache_eligible == 1 && bindcache_enabled;
+    const u64 gpu_map_serial = Tegra::g_gpu_map_serial.load(std::memory_order_acquire);
+    const u64 device_map_serial = Core::g_device_map_serial.load(std::memory_order_acquire);
+    const auto read_raw = [&](const u8* host, GPUVAddr address) {
+        u32 raw;
+        if (host != nullptr) {
+            std::memcpy(&raw, host, sizeof(raw));
+        } else {
+            raw = gpu_memory->Read<u32>(address);
+        }
+        return raw;
+    };
+    auto& tbc = texture_binding_cache;
+    bool texture_hit = false;
+    if (texture_cache_on && tbc.valid && tbc.gpu_map_serial == gpu_map_serial &&
+        tbc.device_map_serial == device_map_serial &&
+        tbc.texture_serial == texture_cache.binding_cache_serial &&
+        tbc.via_header_index == via_header_index) {
+        size_t slot = 0;
+        bool same = true;
+        const auto check_stage = [&](size_t stage) {
+            const auto& stage_cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                for (u32 index = 0; same && index < desc.count; ++index, ++slot) {
+                    if (slot >= tbc.slots.size()) {
+                        same = false;
+                        break;
+                    }
+                    const TextureSlotCache& entry = tbc.slots[slot];
+                    const GPUVAddr address = stage_cbufs[desc.cbuf_index].address +
+                                             desc.cbuf_offset + (index << desc.size_shift);
+                    same = address == entry.handle_address &&
+                           read_raw(entry.handle_host, address) == entry.handle_raw &&
+                           (entry.tic_host == nullptr ||
+                            std::memcmp(entry.tic_host, entry.tic.data(), 32) == 0) &&
+                           (entry.tsc_host == nullptr ||
+                            std::memcmp(entry.tsc_host, entry.tsc.data(), 32) == 0);
+                }
+            }
+        };
+        if constexpr (Spec::enabled_stages[0]) check_stage(0);
+        if constexpr (Spec::enabled_stages[1]) check_stage(1);
+        if constexpr (Spec::enabled_stages[2]) check_stage(2);
+        if constexpr (Spec::enabled_stages[3]) check_stage(3);
+        if constexpr (Spec::enabled_stages[4]) check_stage(4);
+        texture_hit = same && slot == tbc.slots.size();
+    }
+    const bool verify_hit = texture_hit && bindcache_verify;
+    if (verify_hit) {
+        texture_hit = false;
+    }
+    const bool recording = texture_cache_on && !texture_hit;
+    std::vector<TextureSlotCache> recorded_slots;
+    const bool native_tiling = gpu_memory->UsesNativeTiling();
+    const u32 tic_limit = regs.tex_header.limit;
+    const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
+    const auto entry_host = [&](GPUVAddr address) -> const u8* {
+        return gpu_memory->GetPointer(address);
+    };
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -456,13 +596,43 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
-        for (const auto& desc : info.texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
-                views.push_back({handle.first});
+        if (!texture_hit) {
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    std::pair<u32, u32> handle;
+                    if (recording) {
+                        // The values are copied before the full resolution reads them: a write
+                        // in between makes the next comparison fail, never a stale hit.
+                        TextureSlotCache entry{};
+                        entry.handle_address = cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                               (index << desc.size_shift);
+                        entry.handle_host = entry_host(entry.handle_address);
+                        entry.handle_raw = read_raw(entry.handle_host, entry.handle_address);
+                        handle = TexturePair(entry.handle_raw, via_header_index);
+                        const u32 tic = Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
+                                                                           native_tiling);
+                        if (tic <= tic_limit) {
+                            entry.tic_host = entry_host(regs.tex_header.Address() + u64{tic} * 32);
+                            if (entry.tic_host != nullptr) {
+                                std::memcpy(entry.tic.data(), entry.tic_host, 32);
+                            }
+                        }
+                        if (handle.second <= tsc_limit) {
+                            entry.tsc_host =
+                                entry_host(regs.tex_sampler.Address() + u64{handle.second} * 32);
+                            if (entry.tsc_host != nullptr) {
+                                std::memcpy(entry.tsc.data(), entry.tsc_host, 32);
+                            }
+                        }
+                        recorded_slots.push_back(entry);
+                    } else {
+                        handle = read_handle(desc, index);
+                    }
+                    views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-                samplers.push_back(sampler);
+                    VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+                    samplers.push_back(sampler);
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -491,57 +661,160 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             config_stage(4);
         }
     }
+    if (texture_hit) {
+        views.assign(tbc.views.begin(), tbc.views.end());
+        samplers.assign(tbc.samplers.begin(), tbc.samplers.end());
+    }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
-    {
+    if (texture_hit) {
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        texture_cache.PrepareImageViews(std::span(views.data(), views.size()));
+        Profile::Add(Profile::Counter::BindCacheHits, 1);
+    } else {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+        if (verify_hit) {
+            bool equal = views.size() == tbc.views.size() && samplers.size() == tbc.samplers.size();
+            for (size_t i = 0; equal && i < views.size(); ++i) {
+                equal = views[i].id == tbc.views[i].id;
+            }
+            for (size_t i = 0; equal && i < samplers.size(); ++i) {
+                equal = samplers[i] == tbc.samplers[i];
+            }
+            if (!equal) {
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Binding cache mismatch: textures of pipeline {:#x} differ", key.Hash());
+                }
+            }
+            Profile::Add(Profile::Counter::BindCacheVerified, 1);
+        }
+        if (recording) {
+            tbc.valid = true;
+            tbc.via_header_index = via_header_index;
+            tbc.gpu_map_serial = gpu_map_serial;
+            tbc.device_map_serial = device_map_serial;
+            tbc.texture_serial = texture_cache.binding_cache_serial;
+            tbc.slots = std::move(recorded_slots);
+            tbc.views.assign(views.begin(), views.end());
+            tbc.samplers.assign(samplers.begin(), samplers.end());
+            tbc.entries_valid = false;
+        }
+    }
+    // Descriptor entries: pushed again from the cache on a hit, recorded on the first push of a
+    // cached resolution (EDEN_NX2_BINDCACHE_ENTRIES=0 always pushes them the full way).
+    static const bool entries_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BINDCACHE_ENTRIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Bindless pipelines push a slot table instead of texture descriptors (texture_heap).
+    const bool reuse_entries = entries_enabled && !texture_heap && texture_hit && tbc.entries_valid;
+    const bool record_entries =
+        entries_enabled && !texture_heap && texture_cache_on && !reuse_entries;
+    if (texture_heap) {
+        // The words depend only on the views and samplers (a view keeps its heap slots while it
+        // lives; deletion and rescaling invalidate the binding cache), so a hit reuses them.
+        if (!texture_hit || !bindless_words_valid) {
+            BuildBindlessTable(texture_cache, *texture_heap, stage_infos,
+                               std::span<const VideoCommon::ImageViewInOut>{views.data(),
+                                                                            views.size()},
+                               std::span<const VideoCommon::SamplerId>{samplers.data(),
+                                                                       samplers.size()},
+                               bindless_words, bindless_rescaled);
+        }
+        bindless_words_valid = texture_cache_on;
+    }
+    if (record_entries) {
+        tbc.image_entries.clear();
+        tbc.rescaled.clear();
+    }
+    size_t entry_pos = 0;
+    size_t rescaled_pos = 0;
+    // Profiling: how often a draw's bindings repeat the previous draw's (for a fast path).
+    if (Profile::Enabled()) [[unlikely]] {
+        static u64 last_textures{}, last_buffers{};
+        const auto mix = [](u64 hash, u64 value) {
+            return (hash ^ value) * 0x100000001b3ULL;
+        };
+        u64 textures = mix(0xcbf29ce484222325ULL, reinterpret_cast<u64>(this));
+        for (const auto& view : views) {
+            textures = mix(textures, view.id.index);
+        }
+        for (const auto sampler : samplers) {
+            textures = mix(textures, sampler.index);
+        }
+        u64 buffers = 0xcbf29ce484222325ULL;
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            for (const auto& cbuf : maxwell3d->state.shader_stages[stage].const_buffers) {
+                buffers = mix(buffers, cbuf.enabled ? cbuf.address ^ (u64{cbuf.size} << 48) : 0);
+            }
+        }
+        for (const auto& stream : regs.vertex_streams) {
+            buffers = mix(buffers, stream.Address() ^ (u64{stream.stride.Value()} << 52));
+        }
+        buffers = mix(buffers, regs.index_buffer.StartAddress());
+        u64 geometry = 0xcbf29ce484222325ULL;
+        for (const auto& stream : regs.vertex_streams) {
+            geometry = mix(geometry, stream.Address() ^ (u64{stream.stride.Value()} << 52));
+        }
+        geometry = mix(geometry, regs.index_buffer.StartAddress());
+        geometry = mix(geometry, static_cast<u64>(regs.index_buffer.format));
+        static u64 last_geometry{};
+        same_textures_as_last = textures == last_textures;
+        same_geometry_as_last = geometry == last_geometry;
+        last_geometry = geometry;
+        Profile::Add(Profile::Counter::SameTextures, textures == last_textures ? 1 : 0);
+        Profile::Add(Profile::Counter::SameBuffers, buffers == last_buffers ? 1 : 0);
+        last_textures = textures;
+        last_buffers = buffers;
     }
 
-    VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
-    const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
-        size_t index{};
-        const auto add_buffer{[&](const auto& desc) {
-            constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
-            for (u32 i = 0; i < desc.count; ++i) {
-                bool is_written{false};
-                if constexpr (is_image) {
-                    is_written = desc.is_written;
-                }
-                ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
-                PixelFormat format{image_view.format};
-                if constexpr (is_image) {
-                    if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
-                        format = *explicit_format;
+    if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
+        VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+            size_t index{};
+            const auto add_buffer{[&](const auto& desc) {
+                constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
+                for (u32 i = 0; i < desc.count; ++i) {
+                    bool is_written{false};
+                    if constexpr (is_image) {
+                        is_written = desc.is_written;
                     }
+                    ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
+                    PixelFormat format{image_view.format};
+                    if constexpr (is_image) {
+                        if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                            format = *explicit_format;
+                        }
+                    }
+                    buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
+                                                           image_view.BufferSize(), format,
+                                                           is_written, is_image);
+                    ++index;
+                    ++texture_buffer_it;
                 }
-                buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
-                                                       image_view.BufferSize(), format,
-                                                       is_written, is_image);
-                ++index;
-                ++texture_buffer_it;
+            }};
+            buffer_cache.UnbindGraphicsTextureBuffers(stage);
+
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                for (const auto& desc : info.texture_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            if constexpr (Spec::has_image_buffers) {
+                for (const auto& desc : info.image_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
+            if constexpr (Spec::has_images) {
+                texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
             }
         }};
-        buffer_cache.UnbindGraphicsTextureBuffers(stage);
-
-        const Shader::Info& info{stage_infos[stage]};
-        if constexpr (Spec::has_texture_buffers) {
-            for (const auto& desc : info.texture_buffer_descriptors) {
-                add_buffer(desc);
-            }
-        }
-        if constexpr (Spec::has_image_buffers) {
-            for (const auto& desc : info.image_buffer_descriptors) {
-                add_buffer(desc);
-            }
-        }
-        texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
-        if constexpr (Spec::has_images) {
-            texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
-        }
-    }};
-    {
         Profile::Scope scope{Profile::Zone::TextureBuffers};
         if constexpr (Spec::enabled_stages[0]) {
             bind_stage_info(0);
@@ -557,6 +830,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         if constexpr (Spec::enabled_stages[4]) {
             bind_stage_info(4);
+        }
+    } else {
+        if constexpr (Spec::enabled_stages[0]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(4);
         }
     }
 
@@ -579,6 +868,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    const u8* rescaled_it{bindless_rescaled.data()};
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -586,8 +876,53 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
-            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+            // Cached pipelines have plain sampled textures only (texture_cacheable_spec).
+            const Shader::Info& stage_info{stage_infos[stage]};
+            if (texture_heap) {
+                PushBindlessImageDescriptors(
+                    texture_cache, guest_descriptor_queue, stage_info, rescaling, samplers_it,
+                    views_it, rescaled_it, [&] {
+                        if (stage == bindless_table_stage) {
+                            PushBindlessTable(stage);
+                        }
+                    });
+            } else if (reuse_entries) {
+                for (const auto& desc : stage_info.texture_descriptors) {
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        const auto& [image_view, sampler] = tbc.image_entries[entry_pos++];
+                        guest_descriptor_queue.AddSampledImage(image_view, sampler);
+                    }
+                    rescaling.PushTexture(tbc.rescaled[rescaled_pos++] != 0);
+                    views_it += desc.count;
+                    samplers_it += desc.count;
+                }
+            } else if (record_entries) {
+                for (const auto& desc : stage_info.texture_descriptors) {
+                    bool is_rescaled{};
+                    for (u32 index = 0; index < desc.count; ++index) {
+                        ImageView& image_view{texture_cache.GetImageView((views_it++)->id)};
+                        VkImageView vk_image_view{image_view.Handle(desc.type)};
+                        if (vk_image_view == VK_NULL_HANDLE) {
+                            const VkImageView null_image_view{
+                                texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID)
+                                    .Handle(desc.type)};
+                            if (null_image_view != VK_NULL_HANDLE) {
+                                vk_image_view = null_image_view;
+                            }
+                        }
+                        Sampler& sampler{texture_cache.GetSampler(*(samplers_it++))};
+                        const VkSampler vk_sampler{sampler.HandleFor(image_view, desc.is_depth)};
+                        guest_descriptor_queue.AddSampledImage(vk_image_view, vk_sampler);
+                        tbc.image_entries.emplace_back(vk_image_view, vk_sampler);
+                        is_rescaled |= texture_cache.IsRescaling(image_view);
+                    }
+                    rescaling.PushTexture(is_rescaled);
+                    tbc.rescaled.push_back(is_rescaled ? 1 : 0);
+                }
+            } else {
+                PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_info, rescaling,
+                                     samplers_it, views_it);
+            }
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {
@@ -614,6 +949,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
     }
+    if (record_entries) {
+        tbc.entries_valid = true;
+    }
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();
         buffer_cache.any_buffer_uploaded = false;
@@ -627,8 +965,42 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     if (IsBuilt() && !pipeline) {
         return false;
     }
+    if (Profile::Enabled()) [[unlikely]] {
+        // Shape: pipeline + textures (hashed together above) and framebuffer. A merge candidate
+        // also keeps its vertex/index bindings and no small uniform buffer changed bytes.
+        static const void* last_framebuffer{};
+        const void* const framebuffer{texture_cache.GetFramebuffer()};
+        const bool shape{same_textures_as_last && framebuffer == last_framebuffer};
+        last_framebuffer = framebuffer;
+        const bool uniforms_same{Profile::CounterValue(Profile::Counter::UniformCopied) ==
+                                 uniform_copies_before};
+        const bool candidate{shape && same_geometry_as_last && uniforms_same};
+        Profile::Add(Profile::Counter::ShapeSame, shape ? 1 : 0);
+        Profile::Add(Profile::Counter::MergeCandidate, candidate ? 1 : 0);
+        Profile::t_merge_candidate = candidate;
+    }
     Profile::Scope scope{Profile::Zone::ConfigureDraw};
     return ConfigureDraw(rescaling, render_area);
+}
+
+void GraphicsPipeline::PushBindlessTable(size_t stage) {
+    // A UBO of uvec4: four words per vector, the last one zero padded.
+    const u32 num_vectors{static_cast<u32>((bindless_words.size() + 3) / 4)};
+    const u32 size{num_vectors * 16};
+    auto& runtime{buffer_cache.runtime};
+    if (bindless_upload_tick == runtime.CurrentTick() && bindless_uploaded_words == bindless_words) {
+        // The same words in the same command buffer: bind the previous upload again.
+        runtime.RebindStreamUniform(bindless_upload_ref, size);
+        return;
+    }
+    const std::span<u8> span{runtime.BindMappedUniformBuffer(stage, 0, size)};
+    std::memcpy(span.data(), bindless_words.data(), bindless_words.size() * sizeof(u32));
+    std::memset(span.data() + bindless_words.size() * sizeof(u32), 0,
+                size - bindless_words.size() * sizeof(u32));
+    bindless_upload_ref = runtime.LastStreamUniformRef();
+    // After the allocation: the tick its stream region belongs to.
+    bindless_upload_tick = runtime.CurrentTick();
+    bindless_uploaded_words = bindless_words;
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
@@ -698,6 +1070,30 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
         }
     }
+    // C: this pipeline's previous draw is still pending in the scheduler, so nothing at all was
+    // recorded since (no render pass change, helper pass, barrier or other pipeline), and this
+    // draw binds exactly what that one bound: record nothing, and the draw can join its batch.
+    {
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const auto rescaling_now{rescaling.Data()};
+        const size_t payload_bytes{num_descriptor_entries * sizeof(DescriptorUpdateEntry)};
+        // The previous draw's entries are still in the descriptor queue: pending means nothing
+        // was recorded since, so the queue has not been reset either.
+        const DescriptorUpdateEntry* const previous_payload{std::exchange(recorded_payload, entries)};
+        if (scheduler.HasPendingDraws() && !bind_pipeline && !bind_descriptor_buffer &&
+            !update_rescaling && recorded_offset == descriptor_buffer_offset &&
+            recorded_render_area_used == render_area.uses_render_area &&
+            recorded_render_area == render_area.words && recorded_rescaling == rescaling_now &&
+            previous_payload != nullptr &&
+            std::memcmp(previous_payload, entries, payload_bytes) == 0) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SkippedBindings, 1);
+            return true;
+        }
+        recorded_rescaling = rescaling_now;
+        recorded_render_area_used = render_area.uses_render_area;
+        recorded_render_area = render_area.words;
+        recorded_offset = descriptor_buffer_offset;
+    }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
                       rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
@@ -713,6 +1109,13 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            if (texture_heap) {
+                // The heap is set 0 of every bindless layout: switching between bindless
+                // pipelines keeps it; anything else bound in between makes this pipeline rebind.
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                          Shader::Bindless::kHeapSet, texture_heap->Set(),
+                                          nullptr);
+            }
         }
         cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
@@ -732,19 +1135,20 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!descriptor_set_layout) {
             return;
         }
+        const u32 resource_set{texture_heap ? Shader::Bindless::kResourceSet : 0U};
         if (uses_descriptor_buffer) {
             const u32 buffer_index{};
             cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
                                                  0, buffer_index, descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
+                                                    resource_set, descriptor_data);
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};
             dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                      descriptor_set, nullptr);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                      resource_set, descriptor_set, nullptr);
         }
     });
     return true;

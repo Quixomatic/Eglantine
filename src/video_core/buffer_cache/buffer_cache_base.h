@@ -240,7 +240,9 @@ public:
 
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
-    void WriteMemory(DAddr device_addr, u64 size);
+    /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
+    /// when the memory is going away).
+    void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -257,6 +259,14 @@ public:
     }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+
+    /// Writes the same small record to many addresses (DK's indirect draw record resets) whose
+    /// buffer data the GPU wrote: one shared staging copy and one copy command per buffer instead
+    /// of InlineMemory's staging allocation and copy for each. Guest memory must hold the record
+    /// already. The indices of addresses whose data is not GPU-modified are appended to
+    /// `not_inlined`: the caller invalidates them as CPU writes. Takes the buffer cache's lock.
+    void InlineRecords(std::span<const DAddr> addresses, std::span<const u8> record,
+                       std::vector<size_t>& not_inlined);
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
@@ -565,6 +575,34 @@ private:
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 
+    /// A range synchronized while its tracker region had `epoch`: while the region's epoch is
+    /// unchanged no page of it became CPU-modified, so the range has nothing to upload.
+    struct SyncMemo {
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u64 size{};
+        u64 layout_serial{};
+        u64 epoch{};
+    };
+    /// SynchronizeBuffer, skipped while `memo` covers the range and nothing changed.
+    void SynchronizeBufferMemo(SyncMemo& memo, BufferId buffer_id, Buffer& buffer,
+                               DAddr device_addr, u32 size);
+    std::array<SyncMemo, 32> vertex_sync_memo{};
+    SyncMemo index_sync_memo{};
+    /// GetMemoryLayoutSize results (a lock and a map lookup each) for storage buffer bindings,
+    /// valid while the GPU address space is not remapped.
+    struct LayoutSizeMemo {
+        const Tegra::MemoryManager* memory{};
+        GPUVAddr gpu_addr{};
+        u64 map_serial{};
+        u64 size{};
+    };
+    mutable std::array<LayoutSizeMemo, 64> layout_size_memo{};
+    /// Changes whenever a buffer is registered or unregistered.
+    u64 buffer_layout_serial = 1;
+    /// Per (stage, constant buffer): the native 64 KiB bank last checked and the frame it was.
+    std::array<std::array<std::pair<DAddr, u64>, 18>, 5> native_bank_memo{};
+
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
     MemoryTracker memory_tracker;
@@ -639,9 +677,12 @@ private:
 
 
     // Async Buffers
-    Common::OverlapRangeSet<DAddr> async_downloads;
     std::deque<std::optional<Async_Buffer>> async_buffers;
     std::deque<boost::container::small_vector<BufferCopy, 4>> pending_downloads;
+    /// For each entry of pending_downloads: the ranges it still writes to guest memory when its
+    /// fence pops. A write to a range after a download was taken removes it from that download
+    /// (and every other pending one): its bytes are older than the write.
+    std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;

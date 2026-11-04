@@ -33,6 +33,11 @@ class System;
 
 namespace Tegra {
 
+/// Bumped whenever GPU virtual memory is mapped or unmapped (translations and host pointers a
+/// cache kept may have changed).
+inline std::atomic<u64> g_gpu_map_serial{1};
+
+
 class MemoryManager final {
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
@@ -113,6 +118,10 @@ public:
      */
     void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+
+    /// Reads `count` consecutive words as Read<u32> would (Switch 2 syncpoint shim included),
+    /// without a translation per word.
+    void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const;
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
 
     /**

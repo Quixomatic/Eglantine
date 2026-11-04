@@ -55,6 +55,16 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"mcp-port", required_argument, 0, 'P'},
         {"mcp-allow-writes", no_argument, 0, 'W'},
         {"pack-nup", required_argument, 0, 'N'},
+        {"unpack-nup", required_argument, 0, 'U'},
+        {"edit-nup", required_argument, 0, 'E'},
+        {"nup-name", required_argument, 0, 0x100},
+        {"nup-icon", required_argument, 0, 0x101},
+        {"nup-version", required_argument, 0, 0x102},
+        {"nup-publisher", required_argument, 0, 0x103},
+        {"clear-nup-name", no_argument, 0, 0x104},
+        {"clear-nup-icon", no_argument, 0, 0x105},
+        {"clear-nup-version", no_argument, 0, 0x106},
+        {"clear-nup-publisher", no_argument, 0, 0x107},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -106,6 +116,36 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             case 'N':
                 p.pack_nup_source = std::string(optarg);
+                break;
+            case 'U':
+                p.unpack_nup_source = std::string(optarg);
+                break;
+            case 'E':
+                p.edit_nup_source = std::string(optarg);
+                break;
+            case 0x100:
+                p.edit_nup_name = std::string(optarg);
+                break;
+            case 0x101:
+                p.edit_nup_icon = std::string(optarg);
+                break;
+            case 0x102:
+                p.edit_nup_version = std::string(optarg);
+                break;
+            case 0x103:
+                p.edit_nup_publisher = std::string(optarg);
+                break;
+            case 0x104:
+                p.edit_nup_name = std::string{};
+                break;
+            case 0x105:
+                p.edit_nup_icon = std::string{};
+                break;
+            case 0x106:
+                p.edit_nup_version = std::string{};
+                break;
+            case 0x107:
+                p.edit_nup_publisher = std::string{};
                 break;
             case 'i': {
                 p.input_profile = std::string(optarg);
@@ -246,7 +286,13 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "-d, --debug           Run the GDB stub on a port from 1 to 65535\n"
             "-v, --version         Output version information and exit\n"
             "--pack-nup <dump> [<out.nup>]"
-            " Pack a loose dump with all its updates and DLC into a NUP file and exit\n",
+            " Pack a loose dump with all its updates and DLC into a NUP file and exit\n"
+            "--unpack-nup <file.nup> [<out_dir>]"
+            " Extract a NUP back into a loose dump and exit\n"
+            "--edit-nup <file.nup> [--nup-name NAME --nup-icon PATH --nup-version VER"
+            " --nup-publisher NAME --clear-nup-name --clear-nup-icon --clear-nup-version"
+            " --clear-nup-publisher]"
+            " Rewrite default-language NUP metadata in place and exit\n",
             lp.argv0
         );
     }

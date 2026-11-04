@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -143,11 +144,14 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "pbflush", "command sync", "gpu-written params", "3d front init", "mme dma read",
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
+/// Number of Counter values (the enum is below; checked there).
+inline constexpr size_t CounterCount = 39;
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 10> counters{}; ///< See Counter
+    std::array<u64, CounterCount> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
@@ -200,8 +204,38 @@ enum class Counter : u32 {
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
     Draws,          ///< Direct draws reaching the rasterizer
     EmptyDraws,     ///< Of Draws: zero vertices/indices or zero instances
+    ListCopied,     ///< GPU-written command list entries read from their host copy
+    ListSynced,     ///< ...read from guest memory (flushed, no GPU write since)
+    ListNoPage,     ///< ...not readable cheaply: the page has no copy entry yet
+    ListDrawWritten, ///< ...not readable cheaply: draws wrote the page (copies only follow compute/copies)
+    ListStale,      ///< ...not readable cheaply: written again since its copy, or outside it
+    SameTextures,   ///< Draws whose pipeline, image views and samplers match the previous draw
+    SameBuffers,    ///< Draws whose constant buffer, vertex and index bindings match the previous draw
+    UniformReused,  ///< Small uniform binds that rebound the slot's previous allocation (same bytes)
+    UniformCopied,  ///< Small uniform binds that copied their bytes into a new allocation
+    BindCacheHits,  ///< Draws whose textures came from the binding cache
+    BindCacheVerified, ///< Cache hits also resolved the full way (EDEN_NX2_BINDCACHE_VERIFY)
+    InvalRanges,    ///< Ranges invalidated in every cache (InnerInvalidation)
+    InvalBytes,     ///< ...their bytes
+    InlineDeferred, ///< Inline writes whose invalidation waits for the next FlushCaching
+    InlineSame,     ///< Inline writes of the bytes guest memory already held (no invalidation)
+    CbSame,         ///< Constant buffer data writes of the bytes guest memory already held
+    CbWritten,      ///< Constant buffer data writes that changed guest memory
+    SyncUploads,    ///< Buffer synchronizations that uploaded CPU-modified data
+    SyncUploadBytes, ///< ...their bytes
+    SyncSkipped,    ///< Vertex/index synchronizations skipped (region unchanged since the last)
+    ShapeSame,      ///< Draws with the previous draw's pipeline, textures and framebuffer
+    MergeCandidate, ///< ...and its vertex/index bindings, with no uniform buffer changing bytes
+    MergeContiguous, ///< ...indirect, reading the record right after the previous draw's
+    MergedDraws,    ///< Draws recorded as part of the previous draw's multi-draw (Scheduler)
+    SkippedBindings, ///< Draws that recorded no descriptor/push constant/pipeline bind (unchanged)
+    UniformNewAddress, ///< Small uniform binds of another address than the slot's previous bind
+    UniformClean,   ///< ...same address, no command stream write to it, same bytes (compare wasted)
+    UniformStreamWritten, ///< ...same address, a command stream write to it since the last bind
+    UniformUnexplained, ///< ...same address, no command stream write, new bytes (CPU or other)
     Count,
 };
+static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
 
 /// Counts a drain that had to wait (the back still had work).
 inline void NoteDrain(DrainSite site) {
@@ -216,6 +250,37 @@ inline std::unordered_set<u64>& DmaReadPages() {
     static std::unordered_set<u64> pages;
     return pages;
 }
+
+/// This thread's running total of a counter (for deltas around a piece of work).
+[[nodiscard]] inline u64 CounterValue(Counter counter) {
+    return t_data.counters[static_cast<size_t>(counter)];
+}
+
+/// Uniform measurement: the generation of the latest command stream write to each device page
+/// (hashed; a collision only counts a write that did not happen). Filled only while profiling.
+inline u32 g_stream_write_generation{};
+inline std::array<u32, 1u << 16> g_stream_write_pages{};
+
+inline void NoteStreamWrite(u64 device_addr, u64 size) {
+    if (!Enabled() || size == 0) {
+        return;
+    }
+    ++g_stream_write_generation;
+    for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
+        g_stream_write_pages[page & 0xffff] = g_stream_write_generation;
+    }
+}
+
+[[nodiscard]] inline u32 LastStreamWrite(u64 device_addr, u64 size) {
+    u32 latest{};
+    for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
+        latest = (std::max)(latest, g_stream_write_pages[page & 0xffff]);
+    }
+    return latest;
+}
+
+/// C (batching) measurement: whether the latest configured draw could merge with the one before.
+inline thread_local bool t_merge_candidate{};
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
@@ -291,7 +356,17 @@ inline void Report(const char* thread_name = "GPU thread") {
             counter_names{"download_bytes",   "download_copies",   "mme_dma_read_bytes",
                           "download_bytes_on_dma_pages", "method_writes", "same_value_writes",
                           "acquire_checks",   "acquire_waits",     "draws",
-                          "empty_draws"};
+                          "empty_draws",      "list_copied",       "list_synced",
+                          "list_no_page",     "list_draw_written", "list_stale",
+                          "same_textures",    "same_buffers",      "uniform_reused",
+                          "uniform_copied",   "bindcache_hits",    "bindcache_verified",
+                          "inval_ranges",     "inval_bytes",       "inline_deferred",
+                          "inline_same",      "cb_same",           "cb_written",
+                          "sync_uploads",     "sync_upload_bytes", "sync_skipped",
+                          "shape_same",       "merge_candidate",   "merge_contiguous",
+                          "merged_draws",     "skipped_bindings",
+                          "uniform_new_address", "uniform_clean",  "uniform_stream_written",
+                          "uniform_unexplained"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

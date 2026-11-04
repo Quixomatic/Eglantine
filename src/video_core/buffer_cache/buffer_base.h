@@ -113,8 +113,13 @@ public:
         return lru_id;
     }
 
+    /// The frame tick of the last LRU touch: checked here instead of in the LRU pool, whose entry
+    /// is a cache miss for every bound buffer of every draw.
+    u64 lru_touch_tick = ~u64{0};
+
     void setLRUID(size_t lru_id_) {
         lru_id = lru_id_;
+        lru_touch_tick = ~u64{0};
     }
 
     size_t SizeBytes() const {

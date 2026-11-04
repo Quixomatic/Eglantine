@@ -256,7 +256,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
     present_manager.Present(frame);
 #ifdef HAS_LSFG
-    scheduler.DispatchWork();
+    scheduler.DispatchWork(true);
 #endif
 
     gpu.RendererFrameEndNotify();

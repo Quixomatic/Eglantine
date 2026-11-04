@@ -65,6 +65,10 @@ struct Profile {
     bool support_storage_image_array_nonuniform_indexing{};
     bool support_uniform_texel_buffer_array_nonuniform_indexing{};
     bool support_storage_texel_buffer_array_nonuniform_indexing{};
+    /// Sampled textures come from the bindless texture heap (descriptor set Bindless::kHeapSet)
+    /// through a per-draw slot table; the module's other resources use Bindless::kResourceSet.
+    /// Set per pipeline (every stage of a pipeline must agree). See shader_recompiler/bindless.h.
+    bool bindless_textures{};
 
     bool warp_size_potentially_larger_than_guest{};
 

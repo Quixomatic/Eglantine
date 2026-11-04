@@ -453,7 +453,7 @@ void RegisterInputTools(ToolRegistry& registry) {
         .title = "Run an input sequence",
         .description = "Run timed steps in order, each pressing buttons and/or holding sticks for "
                        "hold_ms then waiting wait_ms (max 200 steps, 60 s total). For "
-                       "frame-exact input, use TAS tools instead (coming).",
+                       "frame-exact input, use the TAS tools (tas_write_script, tas_play).",
         .input_schema = {{"type", "object"},
                          {"properties", {{"steps", InputStepsSchema()}, {"player", PlayerSchema()}}},
                          {"required", {"steps"}},

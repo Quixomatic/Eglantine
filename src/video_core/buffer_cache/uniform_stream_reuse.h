@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
 
@@ -51,6 +52,11 @@ public:
         Ref ref{};
         u64 tick{};
         u32 size{}; // 0: nothing streamed yet
+        u64 device_addr{};        // The previous bind's address
+        bool bytes_valid{};       // `bytes` holds that address's bytes (see BindSmallUniformReusing)
+        u32 stream_generation{};  // Profiling only: g_stream_write_generation at the previous bind
+        // A CPU copy on purpose: the stream allocation is upload (write-combined) memory, and
+        // comparing against it instead made reads so slow DK Bananza ran at 1.7 fps.
         std::array<u8, MaxBytes> bytes{};
     };
 
@@ -59,6 +65,7 @@ public:
             for (Slot& slot : stage) {
                 slot.size = 0;
                 slot.tick = 0;
+                slot.bytes_valid = false;
             }
         }
     }
@@ -97,23 +104,61 @@ template <class Runtime, class DeviceMemory>
     }
     Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
     typename Reuse::Slot& slot = reuse.slots[stage][index];
-    u8* const scratch = reuse.scratch.data();
-    device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+    // Compare and copy straight from guest memory when the range is contiguous in host memory
+    // (the usual case): staging every buffer in scratch first was one more full pass over the
+    // bytes for every bound uniform buffer of every draw.
+    const u8* source = nullptr;
+    if constexpr (requires { device_memory.template GetPointer<u8>(device_addr); }) {
+        source = device_memory.template GetPointer<u8>(device_addr);
+        // Within one 4 KiB device page the range is contiguous; check the end only otherwise.
+        constexpr u64 device_page_mask = 0xFFF;
+        if (source != nullptr && (device_addr & device_page_mask) + size > device_page_mask + 1 &&
+            device_memory.template GetPointer<u8>(device_addr + size - 1) != source + size - 1) {
+            source = nullptr;
+        }
+    }
+    if (source == nullptr) {
+        u8* const scratch = reuse.scratch.data();
+        device_memory.ReadBlockUnsafe(device_addr, scratch, size);
+        source = scratch;
+    }
 
-    const bool same_bytes =
-        slot.size == size && std::memcmp(slot.bytes.data(), scratch, size) == 0;
+    // A slot rebound to another address almost never has the same bytes (per-object data: DK binds
+    // 24% of its uniform buffers this way). Compare only against the same address, and keep the
+    // CPU copy only once an address comes back, so those binds copy their bytes once, not twice.
+    const bool same_address = slot.device_addr == device_addr && slot.size == size;
+    const bool same_bytes = same_address && slot.bytes_valid &&
+                            std::memcmp(slot.bytes.data(), source, size) == 0;
+    if (Nx2Profile::Enabled()) [[unlikely]] {
+        if (!same_address) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformNewAddress, 1);
+        } else if (Nx2Profile::LastStreamWrite(device_addr, size) > slot.stream_generation) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformStreamWritten, 1);
+        } else if (same_bytes) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformClean, 1);
+        } else if (slot.bytes_valid) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformUnexplained, 1);
+        }
+        slot.stream_generation = Nx2Profile::g_stream_write_generation;
+    }
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
+        Nx2Profile::Add(Nx2Profile::Counter::UniformReused, 1);
         return true;
     }
+    Nx2Profile::Add(Nx2Profile::Counter::UniformCopied, 1);
     const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-    std::memcpy(span.data(), scratch, size);
+    std::memcpy(span.data(), source, size);
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
-    if (!same_bytes) {
+    if (!same_address) {
+        slot.device_addr = device_addr;
         slot.size = size;
-        std::memcpy(slot.bytes.data(), scratch, size);
+        slot.bytes_valid = false;
+    } else if (!same_bytes) {
+        std::memcpy(slot.bytes.data(), source, size);
+        slot.bytes_valid = true;
     }
     return true;
 }

@@ -2,7 +2,8 @@
 
 The built-in [Model Context Protocol](https://modelcontextprotocol.io) server lets AI agents and scripts
 drive and inspect the emulator. User-facing documentation: [User Handbook - MCP](./user/MCP.md).
-Tool list: [`tools/mcp/README.md`](../tools/mcp/README.md).
+Every tool with its parameters and gating: [MCP Tool Reference](./MCP-tools.md). Short tool list
+and HTTP endpoints: [`tools/mcp/README.md`](../tools/mcp/README.md).
 
 It is compiled in with the `ENABLE_MCP_SERVER` CMake option (ON) and stays off at runtime until the
 user enables it (`enable_mcp_server`, `--mcp`).
@@ -20,6 +21,7 @@ src/mcp/
                     unimplemented commands, watches) read with cursors.
   control.*         Control lease: one session at a time may change emulator state.
   activity.h        What the server is doing, for the status bar and dashboard.
+  dashboard.h       The read-only dashboard page served at GET /.
   host.h            Mcp::Host, implemented by each frontend.
   tools/*.cpp       One file per area; RegisterAllTools() in core_tools.cpp lists them.
 src/yuzu/mcp_host_qt.*       Qt host (marshals to the GUI thread).
@@ -58,6 +60,11 @@ registry.Add(Tool{
 Domain failures return `ToolResult::Error(...)` so the agent sees them; protocol failures are raised
 by the server. `src/tests/mcp/protocol.cpp` checks every registered tool's definition, so keep the
 schema an object with `additionalProperties: false` and give writes the control lease too.
+
+Set `requires_write` only for real writes: input, guest memory, breakpoints, settings and docked
+mode. Lifecycle actions (boot, pause, resume, stop, quit) and anything that only changes the MCP's
+own state need the lease at most. Add the new tool to [MCP-tools.md](./MCP-tools.md) and
+`tools/mcp/README.md`.
 
 ## Core hooks
 

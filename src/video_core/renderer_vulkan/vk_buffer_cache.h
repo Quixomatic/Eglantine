@@ -254,6 +254,10 @@ public:
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
                            VideoCore::Surface::PixelFormat format) {
+        // An unmapped texture buffer has no format; its view is the null buffer's anyway.
+        if (format == VideoCore::Surface::PixelFormat::Invalid) {
+            format = VideoCore::Surface::PixelFormat::R8_UNORM;
+        }
         if (guest_descriptor_queue.UsesDescriptorBuffer()) {
             const VkDeviceAddress address = buffer.DeviceAddress();
             const VkFormat vk_format = address == 0 ? VK_FORMAT_UNDEFINED : TexelBufferFormat(format);

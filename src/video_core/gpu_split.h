@@ -47,6 +47,26 @@ public:
         return front_macros;
     }
 
+    /// Whether the calling thread is the back.
+    [[nodiscard]] static bool OnBackThread() {
+        return on_back_thread;
+    }
+    /// Called on the back before it sleeps waiting for work (the rasterizer submits deferred work).
+    void SetIdleHook(void (*hook)(void*), void* argument) {
+        idle_hook = hook;
+        idle_argument = argument;
+    }
+    /// Any thread: whether the back thread runs (false before it starts and once it stopped).
+    [[nodiscard]] bool BackRunning() const {
+        return back_running.load(std::memory_order_acquire);
+    }
+    /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
+    void RequestIdleHook() {
+        hook_requested.store(true, std::memory_order_seq_cst);
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
+    }
+
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
     /// commands read without cache flushes). Called by the front between commands.
     void MaybeStart(Core::System& system);
@@ -70,12 +90,35 @@ public:
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
+    /// Consecutive macro writes to one engine go into one Run entry (the back loops over them
+    /// instead of dispatching an entry per write: ~2.5 million writes a second in DK Bananza).
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
         SelectEngine(engine);
-        u64* const entry = Reserve(1);
-        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
-        Commit(1);
+        const u64 word = (u64{method & 0xffff} << 8) | (u64{argument} << 32);
+        if (open_run != nullptr && open_run_end == write_position &&
+            ((open_run[0] >> 8) & 0xffffff) < MaxRunWrites) {
+            u64* const next = Reserve(1);
+            // Reserve may have wrapped or published (closing the run): append only right after
+            // the run's last word.
+            if (open_run != nullptr && next == open_run + 1 + ((open_run[0] >> 8) & 0xffffff)) {
+                *next = word;
+                open_run[0] += u64{1} << 8;
+                Commit(1);
+                if (open_run != nullptr) {
+                    open_run_end = write_position;
+                }
+                return;
+            }
+            open_run = nullptr;
+        }
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::Run) | (u64{1} << 8);
+        entry[1] = word;
+        open_run = entry;
+        Commit(2);
+        if (open_run != nullptr) {
+            open_run_end = write_position;
+        }
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -106,7 +149,8 @@ public:
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
-    void WaitForWriters();
+    /// Returns whether any of it was still queued.
+    bool WaitForWriters();
 
 private:
     enum class Kind : u64 {
@@ -115,7 +159,9 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Run,    ///< Bits 8-31 count; then count macro writes (bits 8-23 method, 32-63 argument)
     };
+    static constexpr u64 MaxRunWrites = (u64{1} << 24) - 1;
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
@@ -157,30 +203,42 @@ private:
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
 
+    // Read by both threads, written only while the split starts and stops. Apart from the front's
+    // fields: it writes those for every entry, and the back reads these for every entry.
     Core::System* system{};
     bool active{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
+    void (*idle_hook)(void*){};
+    void* idle_argument{};
 
     // Front side.
-    u64 write_position{};
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The Run entry MacroWrite appends to (unpublished, nothing written after it), or null.
+    u64* open_run{};
+    u64 open_run_end{};
 
     // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
 
     static GpuSplit instance;
+    static inline thread_local bool on_back_thread{};
+    alignas(128) std::atomic<bool> hook_requested{};
+    std::atomic<bool> back_running{};
 
-    alignas(64) std::atomic<u64> published{};
-    alignas(64) std::atomic<u64> consumed{};
+    // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
+    // always touched together by both threads, so they share a block.
+    alignas(128) std::atomic<u64> published{};
+    alignas(128) std::atomic<u64> consumed{};
     /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
-    alignas(64) std::atomic<u64> wait_target{~u64{0}};
-    alignas(64) std::atomic<bool> back_waiting{};
+    alignas(128) std::atomic<u64> wait_target{~u64{0}};
+    alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
 };

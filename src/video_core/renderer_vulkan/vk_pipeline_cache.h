@@ -122,6 +122,7 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    [[nodiscard]] bool IsIndirectResetShader() const;
 
     void TickFrame();
 
@@ -236,6 +237,12 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    /// The pipeline key gate: the last full lookup found `gated_pipeline` for this topology and
+    /// engine state; while no register the key reads changed since (Dirty::PipelineKey), the
+    /// next lookup reuses it without refreshing the key.
+    GraphicsPipeline* gated_pipeline{};
+    u32 gated_topology{};
+    u32 gated_engine_state{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();

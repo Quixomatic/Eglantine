@@ -11,8 +11,9 @@ The server is **off by default**. Turn it on in one of these ways:
 - start the emulator with `--mcp` (this run only; `--mcp-port <port>` implies `--mcp`).
 
 It listens on `http://127.0.0.1:6544/mcp` (Streamable HTTP, loopback only, so only programs on
-this PC can reach it). The **Tools > MCP Server** menu also has *Allow Writes* (lets agents change
-emulator state), *Routes*, *Open Dashboard* and actions that copy the URL or the `claude mcp add`
+this PC can reach it). The **Tools > MCP Server** menu also has *Allow Writes* (lets agents send
+input, write guest memory, set breakpoints, change settings and docked mode; booting, pausing,
+resuming, stopping and quitting don't need it), *Routes*, *Open Dashboard* and actions that copy the URL or the `claude mcp add`
 command to the clipboard. A status-bar label shows whether it is running and what agents are doing.
 
 Settings: `enable_mcp_server` (default off), `mcp_port` (6544), `mcp_allow_writes` (off),
@@ -41,7 +42,8 @@ Test with `npx @modelcontextprotocol/inspector` (transport: Streamable HTTP).
 ## Tools
 
 W = needs *Allow Writes*; L = needs the control lease (granted automatically when no other
-agent holds it, see `acquire_control`).
+agent holds it, see `acquire_control`). Parameters and full gating for every tool:
+[`docs/MCP-tools.md`](../../docs/MCP-tools.md).
 
 | Tool | What it does |
 |---|---|
@@ -65,12 +67,12 @@ agent holds it, see `acquire_control`).
 | `route_record_start`, `route_record_stop` | Record what is played into a route (checkpoints at settled screens, timed input otherwise) |
 | `screenshot_raw` | Capture-layer frame: 1280x720, no post-processing, works hidden/paused |
 | `game_info`, `firmware_status` | Running game metadata and icon; installed firmware |
-| `process_info`, `memory_map`, `list_threads`, `backtrace` | Process layout and modules, mapped regions, guest threads with CPU time, symbolized backtraces |
+| `process_info`, `memory_map`, `list_threads`, `backtrace` (L) | Process layout and modules, mapped regions, guest threads with CPU time, symbolized backtraces |
 | `read_memory`, `search_memory`, `write_memory` (W, L) | Guest memory (typed or hex; pattern search with `??`) |
 | `watch_add`, `watch_list`, `watch_remove` | Values sampled every frame; changes become `watch` timeline events |
 | `scan_start`, `scan_next`, `scan_results` | Cheat-Engine-style search for an unknown address |
 | `ipc_trace`, `ipc_summary`, `svc_trace`, `list_services` | Runtime IPC/SVC tracing into the timeline, call summary, registered services |
-| `debugger_status`, `debugger_attach`, `debugger_detach` | The emulator's GDB stub as the MCP's debugger (the stub must be on when the game boots; `boot_game` attaches automatically then) |
+| `debugger_status`, `debugger_attach` (L), `debugger_detach` (L) | The emulator's GDB stub as the MCP's debugger (the stub must be on when the game boots; `boot_game` attaches automatically then) |
 | `breakpoint_add` (W, L), `breakpoint_list`, `breakpoint_remove` (L) | Exec breakpoints and read/write/access watchpoints by address or `Module+0xoffset`; hits are `break` timeline events with registers and a backtrace (mode `log`), or leave the game paused (mode `stop`) |
 | `debugger_pause`, `debugger_step`, `debugger_continue` (L) | Pause through the debugger, single-step, resume |
 | `dump_set` (W, L), `dump_list`, `dump_read` | Shader (.ash), SPIR-V and macro dumps: turn on, list what was written, read part of a file |
@@ -83,7 +85,7 @@ agent holds it, see `acquire_control`).
 | `baseline_save`, `baseline_check` | Save a known-good frame per game; score the current frame against it |
 | `summarize_since`, `timeline_export`, `compare_runs` | Clustered digest; JSONL export under `<log dir>/mcp`; diff two runs |
 | `settings_list`, `settings_get`, `settings_set` (W, L) | Settings by name (credentials, serials and MCP security settings are hidden) |
-| `debug_knobs`, `set_determinism` (W, L), `env_switches` | A/B knobs, fixed RNG/RTC/language/region, active `EDEN_*` variables |
+| `debug_knobs` (W, L to change), `set_determinism` (W, L), `env_switches` | A/B knobs, fixed RNG/RTC/language/region, active `EDEN_*` variables |
 | `tap`, `swipe` (W, L) | Touch screen input (0..1 coordinates) |
 | `set_docked` (W, L) | Docked/handheld live, with the frontend's controller swap |
 | `frame_advance` (L), `capture_frames` | Run N frames then pause (+ screenshot); a screenshot burst every N frames |
@@ -91,8 +93,9 @@ agent holds it, see `acquire_control`).
 
 MCP resources: `eglantine://tools/guide`, `eglantine://status`, `eglantine://game/current`
 (metadata + saved labels/routes/probes), `eglantine://timeline/summary`. Prompts: `boot_test`,
-`investigate_unimplemented`, `perf_check`, `compare_change`. While running, the server writes
-`<user dir>/mcp-server.json` (url, port, pid; never the token). Log events redact key-like hex.
+`investigate_unimplemented`, `perf_check`, `compare_change`, `find_writer`, `render_bug`. While
+running, the server writes `<user dir>/mcp-server.json` (url, port, pid, frontend, whether a token
+is required, whether writes are on; never the token itself). Log events redact key-like hex.
 
 Crashes (`svcBreak`, fatal) are posted as `crash` timeline events with the thread's backtrace.
 
@@ -104,7 +107,7 @@ Crashes (`svcBreak`, fatal) are posted as `crash` timeline events with the threa
 | `GET /events/wait?kinds=crash,unimpl&timeout_s=600` | Blocks until a matching event, then returns it: run it as a background `curl` to be woken by a crash |
 | `GET /stream/timeline?min_level=info` | The timeline as server-sent events |
 | `GET /mcp` + `Accept: text/event-stream` + session | MCP server-to-client stream: `notifications/message` for crashes, new unimplemented commands, warning+ logs |
-| `GET /status.json`, `GET /screen.png?w=640` | Data behind the dashboard |
+| `GET /status.json`, `GET /screen.png?w=640` | Data behind the dashboard (`/status.json?screen=1` adds the screen label, `&extras=1` the debugger, A/B test and recent reports) |
 
 With `mcp_token` set, pass `Authorization: Bearer <token>` (or `?token=` in a browser).
 
@@ -122,7 +125,8 @@ endpoints (`server.*`, `dashboard.h`), tools (`tools/`, shared pieces in `tool_h
 Frontends implement `Mcp::Host`: `src/yuzu/mcp_host_qt.*` (Qt), `src/yuzu_cmd/mcp_host_cli.*`
 (eden-cli). Core observers the MCP plugs into: `core/debugger/trace_hooks.h` (IPC, SVC,
 crashes), `Service::g_unimplemented_hook`, `VideoCommon::Nx2Profile` snapshots.
-Per-game data: `<config>/mcp/{screens,probes,routes}/<program id>.json`.
+Per-game data: `<config>/mcp/{screens,probes,routes}/<program id>.json`, visual baselines under
+`<config>/mcp/baselines/`.
 Unit tests: `src/tests/mcp/`. Minimal command-line client: `tools/mcp/scripts/mcp.py <tool> [json-args]`
 (set `EGLANTINE_MCP_TOKEN` when a token is configured, and `EGLANTINE_MCP_SID_FILE` per agent so
 each one gets its own session and control lease).

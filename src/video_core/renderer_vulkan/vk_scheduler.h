@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
+
+#include <boost/container/small_vector.hpp>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -50,12 +53,30 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
 
+    /// On the split GPU thread, a fence or a command list copy submits only if the last
+    /// submission is older than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at
+    /// once); otherwise it goes with the next one. The back submits deferred work before it
+    /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
+    bool DeferFlush();
+    /// Submits deferred work (the split's back, from its idle hook).
+    void FlushDeferred();
+    /// Threads other than the split's back: waits until tick is submitted, asking the back to
+    /// submit deferred work (logged every 2 s while it waits). False only when the back thread
+    /// is not running, so nothing will submit it: the caller then submits it itself.
+    bool WaitSubmitted(u64 tick);
+    /// Whether everything up to tick has been handed to the worker for submission.
+    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
+        return tick < master_semaphore->CurrentTick();
+    }
+
     /// Waits for the worker thread to finish executing everything. After this function returns it's
     /// safe to touch worker resources.
     void WaitWorker();
 
     /// Sends currently recorded work to the worker thread.
-    void DispatchWork();
+    /// Sends the current chunk to the worker. A waiting worker is woken once a few chunks are
+    /// queued, or at once with force_wake (submissions and waits for the worker need it).
+    void DispatchWork(bool force_wake = false);
 
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer);
@@ -107,6 +128,10 @@ public:
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
+        // Merged draws go first: anything recorded after them must also run after them.
+        if (pending_draws.kind != PendingDraws::Kind::None) [[unlikely]] {
+            FlushPendingDraws();
+        }
         if (chunk->Record(command)) {
             return;
         }
@@ -121,6 +146,26 @@ public:
             [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
                 command(cmdbuf);
             });
+    }
+
+    /// Draw merging (C): a draw is held back while the next one may join it. A draw joins the
+    /// held batch when nothing else was recorded in between (any other command records the batch
+    /// first, so nothing is ever reordered) and it draws the same way: same kind, instance count
+    /// and first instance; indirect draws also read the record right after the batch's. A batch
+    /// is recorded as one vkCmdDrawMulti(Indexed)EXT or multi-draw indirect call, or a loop where
+    /// those are missing. `mergeable` is false for pipelines whose shaders read the draw index.
+    void RecordDraw(bool mergeable, u32 vertex_count, u32 instance_count, u32 first_vertex,
+                    u32 first_instance);
+    void RecordDrawIndexed(bool mergeable, u32 index_count, u32 instance_count, u32 first_index,
+                           s32 vertex_offset, u32 first_instance);
+    void RecordDrawIndirect(bool mergeable, bool indexed, VkBuffer buffer, VkDeviceSize offset,
+                            u32 stride);
+    /// Records the held batch, if any.
+    void FlushPendingDraws();
+
+    /// Whether a draw is held back: nothing was recorded since it.
+    [[nodiscard]] bool HasPendingDraws() const noexcept {
+        return pending_draws.kind != PendingDraws::Kind::None;
     }
 
     /// Whether the recording thread submitted `tick` within 20 ms.
@@ -192,6 +237,9 @@ public:
     std::mutex submit_mutex;
 
 private:
+    std::chrono::steady_clock::time_point last_flush{};
+    bool flush_pending{};
+
     class Command {
     public:
         virtual ~Command() = default;
@@ -285,6 +333,23 @@ private:
         u32 descriptor_buffer_chunk = 0;
         bool descriptor_buffer_bound = false;
     };
+
+    struct PendingDraws {
+        enum class Kind : u8 { None, Draw, DrawIndexed, Indirect, IndirectIndexed };
+        Kind kind = Kind::None;
+        u32 instance_count = 0;
+        u32 first_instance = 0;
+        boost::container::small_vector<VkMultiDrawInfoEXT, 16> draws;
+        boost::container::small_vector<VkMultiDrawIndexedInfoEXT, 16> indexed_draws;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        u32 stride = 0;
+        u32 indirect_count = 0;
+    };
+    PendingDraws pending_draws;
+    bool merge_draws = false;
+    bool multi_draw = false;
+    bool multi_draw_indirect = false;
 
     struct DeferredClear {
         const Framebuffer* framebuffer = nullptr;

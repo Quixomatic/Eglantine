@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -15,6 +17,7 @@
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
@@ -215,18 +218,21 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 }
 
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
+    g_gpu_map_serial.fetch_add(1, std::memory_order_acq_rel);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
 }
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
+    g_gpu_map_serial.fetch_add(1, std::memory_order_acq_rel);
     if (is_big_pages)
         return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
     return PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
 }
 
 void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
+    g_gpu_map_serial.fetch_add(1, std::memory_order_acq_rel);
     if (size == 0) {
         return;
     }
@@ -467,6 +473,18 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
     ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
 }
 
+void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count) const {
+    const std::size_t size = count * sizeof(u32);
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && gpu_src_addr < shim + NumShimSyncpoints * sizeof(u32) && gpu_src_addr + size > shim) {
+        for (std::size_t i = 0; i < count; ++i) {
+            dest[i] = Read<u32>(gpu_src_addr + i * sizeof(u32));
+        }
+        return;
+    }
+    ReadBlockUnsafe(gpu_src_addr, dest, size);
+}
+
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
@@ -513,6 +531,31 @@ void MemoryManager::WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buf
 }
 
 void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size) {
+    // Constant buffer data of the bytes guest memory already holds (DK rewrites its constants
+    // with the same values every frame) leaves every cache valid, unless the buffer cache may
+    // hold newer GPU-written data for the page (the bit is sticky, so this errs to invalidating).
+    // Switch 2 titles only, where that bit is kept; EDEN_NX2_INLINE_SAME=0 invalidates anyway.
+    static const bool skip_same = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_SAME");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_same && size != 0 && g_nx2_ampere.load(std::memory_order_relaxed) &&
+        (gpu_dest_addr & (Core::DEVICE_PAGESIZE - 1)) + size <= Core::DEVICE_PAGESIZE) {
+        if (const auto device = GpuToCpuAddress(gpu_dest_addr);
+            device && !Nx2IsGpuWritten(*device)) {
+            const u8* const existing = memory.GetPointer<u8>(*device);
+            if (existing != nullptr && std::memcmp(existing, src_buffer, size) == 0) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CbSame, 1);
+                return;
+            }
+        }
+    }
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CbWritten, 1);
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        if (const auto device = GpuToCpuAddress(gpu_dest_addr)) {
+            VideoCommon::Nx2Profile::NoteStreamWrite(*device, size);
+        }
+    }
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
     accumulator.Add(gpu_dest_addr, size);
 }

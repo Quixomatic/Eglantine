@@ -45,6 +45,9 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// Bindless only: the heap array (image class) and the slot table index of element 0.
+    u32 image_class{};
+    u32 element_base{};
 };
 
 struct TextureBufferDefinition {
@@ -421,6 +424,18 @@ public:
     bool uses_nonuniform_uniform_texel_buffer{};
     bool uses_nonuniform_storage_texel_buffer{};
 
+    /// The descriptor set of the module's own resources (Bindless::kResourceSet when bindless).
+    u32 descriptor_set{};
+    /// Bindless textures: the slot table (Uniform block of uvec4), a pointer to one of its words,
+    /// the heap's image arrays by class (declared on use) and its sampler array.
+    Id bindless_table{};
+    Id bindless_table_word_pointer{};
+    std::array<Id, 32> bindless_images{};
+    std::array<Id, 32> bindless_image_pointers{};
+    Id bindless_samplers{};
+    Id bindless_sampler_type{};
+    Id bindless_sampler_pointer{};
+
 private:
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
@@ -434,12 +449,14 @@ private:
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineBindlessTextures(const Info& info, u32& binding, Bindings& bindings);
+    Id BindlessHeapArray(u32 image_class, Id image_type);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
-    void DefineRescalingInputPushConstant();
+    void DefineRescalingInputPushConstant(const Info& info);
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
 

@@ -69,7 +69,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
-    FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
+    FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                                 FEATURE(EXT, MultiDraw, MULTI_DRAW, multi_draw)                                                \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
@@ -434,6 +434,11 @@ FN_MAX_LIMIT_LIST
 
     bool IsOptimalAstcSupported() const {
         return is_optimal_astc_supported;
+    }
+
+    /// Returns true if geometry shaders are supported.
+    bool IsGeometryShaderSupported() const {
+        return features.features.geometryShader;
     }
 
     /// Returns true if BCn is natively supported.
@@ -959,9 +964,31 @@ FN_MAX_LIMIT_LIST
         return extensions.astc_decode_mode;
     }
 
+    /// Returns true if the device draws several ranges in one command (VK_EXT_multi_draw).
+    bool IsExtMultiDrawSupported() const {
+        return extensions.multi_draw && features.multi_draw.multiDraw;
+    }
+
+    /// Returns true if indirect draws can read several records (multiDrawIndirect).
+    bool IsMultiDrawIndirectSupported() const {
+        return features.features.multiDrawIndirect;
+    }
+
     /// Returns true if descriptor bindings is partially bound.
     bool IsDescriptorBindingPartiallyBoundSupported() const {
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
+    }
+
+    /// Whether bindless textures (a global update-after-bind texture heap indexed by shaders)
+    /// were requested (EDEN_NX2_BINDLESS=1) and the device supports them; decided at creation,
+    /// which enables the descriptor indexing features they need.
+    bool IsBindlessTexturesEnabled() const {
+        return bindless_textures_enabled;
+    }
+
+    /// Descriptor indexing limits (update-after-bind descriptor counts).
+    const VkPhysicalDeviceDescriptorIndexingProperties& DescriptorIndexingProperties() const {
+        return properties.descriptor_indexing;
     }
 
     bool HasTimelineSemaphore() const;
@@ -1237,6 +1264,7 @@ private:
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
+    bool bindless_textures_enabled{}; ///< See IsBindlessTexturesEnabled.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
     bool graphics_family_sparse_binding{};
@@ -1285,6 +1313,7 @@ private:
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
 
         VkPhysicalDeviceProperties properties{};
     };

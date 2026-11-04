@@ -37,6 +37,15 @@ public:
     /// Write multiple values to the register identified by method.
     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
 
+    /// A run of macro writes from the GPU split's ring, each word bits 8-23 method and 32-63
+    /// argument: CallMethod for each, which an engine can do faster as a batch.
+    virtual void CallMethodRun(Core::System& system, const u64* words, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            CallMethod(system, static_cast<u32>((words[i] >> 8) & 0xffff),
+                       static_cast<u32>(words[i] >> 32), true);
+        }
+    }
+
     void ConsumeSink(Core::System& system) {
         if (!method_sink.empty()) {
             ConsumeSinkImpl(system);

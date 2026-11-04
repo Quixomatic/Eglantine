@@ -164,6 +164,18 @@ private:
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 
+public:
+    /// Whether a stage reads the draw index builtin (gl_DrawID): its draws are never merged.
+    [[nodiscard]] bool ReadsDrawIndex() const noexcept {
+        return reads_draw_index;
+    }
+
+private:
+    bool reads_draw_index{};
+
+    /// Bindless: pushes the slot table's descriptor (the table's stage, in its texture slot).
+    void PushBindlessTable(size_t stage);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
@@ -206,6 +218,59 @@ private:
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    /// What the last recorded draw of this pipeline bound (C: an identical next draw records
+    /// nothing while that draw is still pending in the scheduler).
+    const DescriptorUpdateEntry* recorded_payload{};
+    std::remove_cvref_t<decltype(std::declval<RescalingPushConstant>().Data())> recorded_rescaling{};
+    std::array<f32, 4> recorded_render_area{};
+    bool recorded_render_area_used{};
+    VkDeviceSize recorded_offset{};
+
+    /// Binding cache, texture side: the last full resolution's image views and samplers and the
+    /// values they came from (each handle word and its 32-byte TIC and TSC entries), with host
+    /// pointers to them. Reused while the values compare equal: DK rewrites these every frame with
+    /// the same contents, so they are compared, not write-tracked; the pointers skip the address
+    /// translation a full resolution does for every read.
+    struct TextureSlotCache {
+        GPUVAddr handle_address;
+        const u8* handle_host;
+        u32 handle_raw;
+        const u8* tic_host;
+        const u8* tsc_host;
+        std::array<u8, 32> tic;
+        std::array<u8, 32> tsc;
+    };
+    struct TextureBindingCache {
+        bool valid{};
+        bool via_header_index{};
+        u64 gpu_map_serial{};
+        u64 device_map_serial{};
+        u64 texture_serial{};
+        std::vector<TextureSlotCache> slots;
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+        /// The descriptor entries these views and samplers produced (image view and sampler
+        /// handles, and per texture descriptor whether it is rescaled), pushed again on a hit:
+        /// they change only with what invalidates the cache (deletion, rescaling).
+        bool entries_valid{};
+        std::vector<std::pair<VkImageView, VkSampler>> image_entries;
+        std::vector<u8> rescaled;
+    };
+    TextureBindingCache texture_binding_cache;
+
+    /// Bindless textures (see .plans/bindless-design.md): the heap, null when this pipeline binds
+    /// its textures the classic way; the stage whose texture slot holds the slot table; the table
+    /// words of the last draw and the stream allocation they were uploaded to.
+    TextureHeap* texture_heap{};
+    size_t bindless_table_stage{};
+    std::vector<u32> bindless_words;
+    std::vector<u8> bindless_rescaled;
+    bool bindless_words_valid{};
+    std::vector<u32> bindless_uploaded_words;
+    BufferCacheRuntime::StreamUniformRef bindless_upload_ref{};
+    u64 bindless_upload_tick{~0ULL};
+    /// -1 not computed, 0 no, 1 yes: only plain sampled textures with constant buffer handles.
+    s8 texture_cache_eligible{-1};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};

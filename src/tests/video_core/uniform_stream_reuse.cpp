@@ -73,15 +73,20 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
               "valid small uniform rejected");
         CheckBound(runtime, memory, address, size);
     };
+    // The first bind of an address keeps no CPU copy, the second makes it, the third can reuse.
     bind(0, 0, 0, 64);
     bind(0, 0, 0, 64);
-    Check(runtime.allocations.size() == 1, "identical bytes were copied twice");
+    Check(runtime.allocations.size() == 2, "an address's second bind has nothing to compare with");
+    bind(0, 0, 0, 64);
+    Check(runtime.allocations.size() == 2, "identical bytes were copied again");
     memory.bytes[7] = 23;
     bind(0, 0, 0, 64);
-    Check(runtime.allocations.size() == 2, "changed bytes reused stale data");
+    Check(runtime.allocations.size() == 3, "changed bytes reused stale data");
+    bind(0, 0, 64, 64);
+    Check(runtime.allocations.size() == 4, "another address reused the slot's allocation");
     bind(0, 1, 0, 64);
     bind(1, 0, 0, 64);
-    Check(runtime.allocations.size() == 4, "stage or slot shared the wrong allocation");
+    Check(runtime.allocations.size() == 6, "stage or slot shared the wrong allocation");
     runtime.NextTick();
     bind(0, 0, 0, 64);
     Check(runtime.allocations.size() == 1, "a new command buffer reused an old allocation");

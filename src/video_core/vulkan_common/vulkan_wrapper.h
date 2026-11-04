@@ -233,6 +233,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount{};
     PFN_vkCmdDrawIndirectByteCountEXT vkCmdDrawIndirectByteCountEXT{};
     PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT{};
+    PFN_vkCmdDrawMultiEXT vkCmdDrawMultiEXT{};
+    PFN_vkCmdDrawMultiIndexedEXT vkCmdDrawMultiIndexedEXT{};
     PFN_vkCmdEndConditionalRenderingEXT vkCmdEndConditionalRenderingEXT{};
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
@@ -1327,6 +1329,18 @@ public:
     void DrawIndexedIndirect(VkBuffer src_buffer, VkDeviceSize src_offset, u32 draw_count,
                              u32 stride) const noexcept {
         dld->vkCmdDrawIndexedIndirect(handle, src_buffer, src_offset, draw_count, stride);
+    }
+
+    void DrawMultiEXT(Span<VkMultiDrawInfoEXT> draws, u32 instance_count,
+                      u32 first_instance) const noexcept {
+        dld->vkCmdDrawMultiEXT(handle, draws.size(), draws.data(), instance_count, first_instance,
+                               sizeof(VkMultiDrawInfoEXT));
+    }
+
+    void DrawMultiIndexedEXT(Span<VkMultiDrawIndexedInfoEXT> draws, u32 instance_count,
+                             u32 first_instance) const noexcept {
+        dld->vkCmdDrawMultiIndexedEXT(handle, draws.size(), draws.data(), instance_count,
+                                      first_instance, sizeof(VkMultiDrawIndexedInfoEXT), nullptr);
     }
 
     void DrawMeshTasksEXT(u32 group_count_x, u32 group_count_y, u32 group_count_z) const noexcept {

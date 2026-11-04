@@ -61,6 +61,42 @@ void SetupDirtyRenderTargets(Maxwell3D::DirtyState::Tables& tables) {
     }
 }
 
+void SetupDirtyPipelineKey(Maxwell3D::DirtyState::Tables& tables) {
+    // Every register marks the pipeline key dirty, except per-draw data that the key never
+    // reads. A register missing from this list only costs a key refresh; one wrongly in it would
+    // reuse a stale pipeline (EDEN_NX2_KEY_GATE_VERIFY=1 checks every reuse).
+    auto& table = tables[2];
+    table.fill(PipelineKey);
+    const auto clear = [&](std::size_t begin, std::size_t num) {
+        for (std::size_t i = begin; i < begin + num && i < table.size(); ++i) {
+            table[i] = NullEntry;
+        }
+    };
+    clear(OFF(const_buffer), NUM(const_buffer));
+    clear(OFF(bind_groups), NUM(bind_groups));
+    clear(OFF(draw), NUM(draw));
+    clear(OFF(index_buffer), NUM(index_buffer));
+    clear(OFF(index_buffer32_first), NUM(index_buffer32_first));
+    clear(OFF(index_buffer16_first), NUM(index_buffer16_first));
+    clear(OFF(index_buffer8_first), NUM(index_buffer8_first));
+    clear(OFF(index_buffer32_subsequent), NUM(index_buffer32_subsequent));
+    clear(OFF(index_buffer16_subsequent), NUM(index_buffer16_subsequent));
+    clear(OFF(index_buffer8_subsequent), NUM(index_buffer8_subsequent));
+    clear(OFF(vertex_buffer), NUM(vertex_buffer));
+    clear(OFF(global_base_vertex_index), NUM(global_base_vertex_index));
+    clear(OFF(global_base_instance_index), NUM(global_base_instance_index));
+    clear(OFF(report_semaphore), NUM(report_semaphore));
+    clear(OFF(shadow_ram_control), NUM(shadow_ram_control));
+    clear(OFF(load_mme), NUM(load_mme));
+    for (std::size_t i = 0; i < Maxwell3D::Regs::NumVertexArrays; ++i) {
+        // The address words of each stream (its stride and frequency can be pipeline state).
+        clear(OFF(vertex_streams) + i * NUM(vertex_streams[0]) + 1, 2);
+        clear(OFF(vertex_stream_limits) + i * NUM(vertex_stream_limits[0]),
+              NUM(vertex_stream_limits[0]));
+        clear(0x600 / sizeof(u32) + i * 2, 2);
+    }
+}
+
 void SetupDirtyShaders(Maxwell3D::DirtyState::Tables& tables) {
     FillBlock(tables[0], OFF(pipelines), NUM(pipelines[0]) * Maxwell3D::Regs::MaxShaderProgram,
               Shaders);
@@ -75,6 +111,7 @@ void SetupDirtyFlags(Maxwell3D::DirtyState::Tables& tables) {
     SetupDirtyDescriptors(tables);
     SetupDirtyRenderTargets(tables);
     SetupDirtyShaders(tables);
+    SetupDirtyPipelineKey(tables);
 }
 
 } // namespace VideoCommon::Dirty

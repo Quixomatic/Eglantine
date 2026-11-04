@@ -70,7 +70,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 19;
+constexpr u32 CACHE_VERSION = 21;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -443,7 +443,12 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
 }
 
 bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
-    return std::memcmp(&rhs, this, Size()) == 0;
+    if (unique_hashes != rhs.unique_hashes) {
+        return false;
+    }
+    return std::memcmp(reinterpret_cast<const char*>(this) + sizeof(unique_hashes),
+                       reinterpret_cast<const char*>(&rhs) + sizeof(unique_hashes),
+                       state.Size()) == 0;
 }
 
 namespace {
@@ -810,14 +815,58 @@ void PipelineCache::SaveUsedPipelines() {
     }
 }
 
+bool PipelineCache::IsIndirectResetShader() const {
+    constexpr size_t vertex_b = static_cast<size_t>(Maxwell::ShaderType::VertexB);
+    constexpr u64 reset_key = 0x72fd62555e7196cdULL;
+    const auto* info = shader_infos[vertex_b];
+    return maxwell3d->regs.IsShaderConfigEnabled(vertex_b) && info && info->lowered_native &&
+           info->lowered_native->source_size == 128 + 11 * 16 &&
+           info->lowered_native->diagnostic_key == reset_key;
+}
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     if (num_translated.load(std::memory_order_acquire) != 0) {
         AdoptTranslatedGraphicsPipelines();
     }
+    auto& dirty{maxwell3d->dirty.flags};
+    const bool shaders_changed{dirty[VideoCommon::Dirty::Shaders]};
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
+        gated_pipeline = nullptr;
         return nullptr;
     }
+    // C: the draw's pipeline state is unchanged from the last lookup (98% of draws in DK): reuse
+    // its pipeline without re-reading every register into the key and comparing it.
+    // EDEN_NX2_KEY_GATE=0 turns it off; EDEN_NX2_KEY_GATE_VERIFY=1 refreshes the key anyway and
+    // logs any difference.
+    static const bool gate_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_KEY_GATE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool gate_verify = std::getenv("EDEN_NX2_KEY_GATE_VERIFY") != nullptr;
+    const u32 topology{static_cast<u32>(maxwell3d->draw_manager.draw_state.topology)};
+    const u32 engine_state{static_cast<u32>(maxwell3d->engine_state)};
+    if (gate_enabled && gated_pipeline != nullptr && gated_pipeline == current_pipeline &&
+        !shaders_changed && !dirty[VideoCommon::Dirty::PipelineKey] &&
+        topology == gated_topology && engine_state == gated_engine_state) {
+        if (gate_verify) [[unlikely]] {
+            GraphicsPipelineCacheKey check{graphics_key};
+            check.state.Refresh(*maxwell3d, dynamic_features);
+            if (std::memcmp(&check, &graphics_key, sizeof(check)) != 0) {
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render_Vulkan, "Pipeline key gate mismatch: key changed without "
+                                               "Dirty::PipelineKey");
+                }
+            }
+        }
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
+    dirty[VideoCommon::Dirty::PipelineKey] = false;
+    gated_pipeline = nullptr;
+    gated_topology = topology;
+    gated_engine_state = engine_state;
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
 
     if (current_pipeline) {
@@ -825,10 +874,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         if (next) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);
+            gated_pipeline = current_pipeline;
             return BuiltPipeline(current_pipeline);
         }
     }
-    return CurrentGraphicsPipelineSlowPath();
+    GraphicsPipeline* const found{CurrentGraphicsPipelineSlowPath()};
+    if (found != nullptr && found == current_pipeline) {
+        gated_pipeline = current_pipeline;
+    }
+    return found;
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline() {
@@ -1343,8 +1397,27 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
         if (key.unique_hashes[index] == 0) {
             continue;
         }
+        if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
+            !device.IsGeometryShaderSupported() && maxwell3d != nullptr &&
+            maxwell3d->GetNativeMacroEngine().native_turing) {
+            // A native (Switch 2) geometry program on a device without geometry shaders: the
+            // pipeline cannot run it, so its draws are skipped.
+            static std::atomic<bool> logged{};
+            if (!logged.exchange(true)) {
+                LOG_WARNING(Render_Vulkan, "Skipping native geometry shader pipelines: the device has no geometry shaders");
+            }
+            return nullptr;
+        }
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
+
+        // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
+        // skipped (see the pipeline check in the rasterizer).
+        if ((env.ShaderStage() == Shader::Stage::Task ||
+             env.ShaderStage() == Shader::Stage::Mesh) &&
+            !device.IsExtMeshShaderSupported()) {
+            return nullptr;
+        }
 
         // Control flow analysis, translation and the dual vertex merge are charged together.
         std::optional<PipelineStats::ScopedTimer> translate_timer;
@@ -1411,6 +1484,23 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     auto modules{std::make_shared<GraphicsShaderModules>()};
 
+    // Bindless textures are decided per pipeline from its stages (UsesBindlessTextures, which
+    // GraphicsPipeline repeats with the same infos), and every stage is emitted for it.
+    Shader::Profile pipeline_profile{profile};
+    {
+        std::array<const Shader::Info*, Maxwell::MaxShaderStage> stage_infos{};
+        for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+             index < Maxwell::MaxShaderProgram; ++index) {
+            const bool is_emulated_stage = layer_source_program != nullptr &&
+                                           index == static_cast<u32>(Maxwell::ShaderType::Geometry);
+            if (index != 0 && (key.unique_hashes[index] != 0 || is_emulated_stage)) {
+                stage_infos[index - 1] = &programs[index].info;
+            }
+        }
+        pipeline_profile.bindless_textures =
+            UsesBindlessTextures(device.IsBindlessTexturesEnabled(), stage_infos);
+    }
+
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
     for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0; index < Maxwell::MaxShaderProgram;
@@ -1432,7 +1522,7 @@ std::shared_ptr<ReusableShaders> PipelineCache::BuildGraphicsShaders(
         {
             const PipelineStats::ScopedTimer emit_timer{PipelineStats::Kind::Graphics,
                                                         PipelineStats::Stage::Emit};
-            code = EmitSPIRV(profile, runtime_info, program, binding);
+            code = EmitSPIRV(pipeline_profile, runtime_info, program, binding);
         }
         device.SaveShader(code);
         {

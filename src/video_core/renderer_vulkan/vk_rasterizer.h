@@ -133,6 +133,14 @@ public:
     bool AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
+    bool SupportsGameDlssNetwork() const override;
+    bool UsesNvidiaDlss() const override;
+    bool CanProbeGameDlssOutput() const override {
+        return true;
+    }
+    std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
+        const Tegra::Engines::Fermi2D::Surface& src,
+        const Tegra::Engines::Fermi2D::Surface& dst) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
@@ -168,6 +176,14 @@ private:
 
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
+    bool TryNx2IndirectReset();
+    /// Whether the draw being prepared may join the previous draw's multi-draw (C).
+    bool draw_mergeable{};
+    /// TryNx2IndirectReset's per-reset scratch (kept to avoid allocating every reset).
+    std::vector<GPUVAddr> reset_gpu_addresses;
+    std::vector<DAddr> reset_device_addresses;
+    std::vector<u8> reset_changed;
+    std::vector<size_t> reset_not_inlined;
 
     void FlushWork();
 

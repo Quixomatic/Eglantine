@@ -8,11 +8,13 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/bindless.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -134,6 +136,27 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
     }
 }
 
+/// Whether a graphics pipeline with these stages samples its textures from the bindless texture
+/// heap. Shader emission (PipelineCache) and the pipeline itself (layout, draws) both decide with
+/// this, so they always agree. Task/mesh pipelines and tables over the UBO limit stay classic.
+[[nodiscard]] inline bool UsesBindlessTextures(bool heap_available,
+                                               std::span<const Shader::Info* const> infos) {
+    if (!heap_available) {
+        return false;
+    }
+    u32 elements{};
+    for (const Shader::Info* const info : infos) {
+        if (info == nullptr) {
+            continue;
+        }
+        if (info->is_task || info->is_mesh) {
+            return false;
+        }
+        elements += Shader::NumDescriptors(info->texture_descriptors);
+    }
+    return elements != 0 && elements <= Shader::Bindless::kMaxTableElements;
+}
+
 [[nodiscard]] inline u32 NumDescriptorEntries(const Shader::Info& info) {
     return Shader::NumDescriptors(info.constant_buffer_descriptors) +
            Shader::NumDescriptors(info.storage_buffers_descriptors) +
@@ -238,8 +261,20 @@ public:
             .pipelineBindPoint =
                 is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
             .pipelineLayout = pipeline_layout,
-            .set = 0,
+            .set = bindless ? Shader::Bindless::kResourceSet : 0U,
         });
+    }
+
+    /// Bindless textures (see shader_recompiler/bindless.h): sampled textures come from the heap
+    /// (set 0) through one slot table UBO, which takes the place of the first textured stage's
+    /// texture bindings; the pipeline's own set is set 1. Call before Add.
+    void SetBindless(VkDescriptorSetLayout heap_layout_) noexcept {
+        bindless = true;
+        heap_layout = heap_layout_;
+    }
+
+    [[nodiscard]] bool IsBindless() const noexcept {
+        return bindless;
     }
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
@@ -253,6 +288,18 @@ public:
             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
                     static_cast<u32>(sizeof(RenderAreaLayout)),
         };
+        const std::array set_layouts{heap_layout, descriptor_set_layout};
+        if (bindless) {
+            return device->GetLogical().CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .setLayoutCount = static_cast<u32>(set_layouts.size()),
+                .pSetLayouts = set_layouts.data(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &range,
+            });
+        }
         return device->GetLogical().CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
@@ -271,11 +318,38 @@ public:
         Add(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, stage, info.storage_buffers_descriptors);
         Add(VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, stage, info.texture_buffer_descriptors);
         Add(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, stage, info.image_buffer_descriptors);
-        Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        if (!bindless) {
+            Add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, stage, info.texture_descriptors);
+        } else if (!info.texture_descriptors.empty() && !texture_table_added) {
+            // Mirrors EmitContext::DefineBindlessTextures: every later stage reads it too.
+            texture_table_added = true;
+            AddOne(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_ALL_GRAPHICS, 1);
+        }
         Add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, stage, info.image_descriptors);
     }
 
 private:
+    void AddOne(VkDescriptorType type, VkShaderStageFlags stage, u32 count) {
+        bindings.push_back({
+            .binding = binding,
+            .descriptorType = type,
+            .descriptorCount = count,
+            .stageFlags = stage,
+            .pImmutableSamplers = nullptr,
+        });
+        entries.push_back({
+            .dstBinding = binding,
+            .dstArrayElement = 0,
+            .descriptorCount = count,
+            .descriptorType = type,
+            .offset = offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        ++binding;
+        num_descriptors += count;
+        offset += sizeof(DescriptorUpdateEntry) * count;
+    }
+
     template <typename Descriptors>
     void Add(VkDescriptorType type, VkShaderStageFlags stage, const Descriptors& descriptors) {
         const size_t num{descriptors.size()};
@@ -303,6 +377,9 @@ private:
 
     const Device* device{};
     bool is_compute{};
+    bool bindless{};
+    bool texture_table_added{};
+    VkDescriptorSetLayout heap_layout{};
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> entries;
     u32 binding{};
@@ -389,6 +466,74 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
             is_rescaled |= element_rescaled;
+        }
+        rescaling.PushImage(is_rescaled);
+    }
+}
+
+/// Bindless textures (see shader_recompiler/bindless.h): the slot table words of a draw, one per
+/// texture element in descriptor order across `infos`, and each texture descriptor's rescaling bit.
+/// `views` and `samplers` are the draw's resolved lists (texture buffers, image buffers, textures,
+/// images per stage, as GraphicsPipeline::ConfigureImpl fills them).
+template <size_t NumStages>
+inline void BuildBindlessTable(TextureCache& texture_cache, TextureHeap& heap,
+                               const std::array<Shader::Info, NumStages>& infos,
+                               std::span<const VideoCommon::ImageViewInOut> views,
+                               std::span<const VideoCommon::SamplerId> samplers,
+                               std::vector<u32>& words, std::vector<u8>& rescaled) {
+    words.clear();
+    rescaled.clear();
+    const VideoCommon::ImageViewInOut* view_it{views.data()};
+    const VideoCommon::SamplerId* sampler_it{samplers.data()};
+    for (const Shader::Info& info : infos) {
+        view_it += Shader::NumDescriptors(info.texture_buffer_descriptors);
+        view_it += Shader::NumDescriptors(info.image_buffer_descriptors);
+        for (const auto& desc : info.texture_descriptors) {
+            const u32 image_class{Shader::Bindless::ImageClass(desc.type, desc.is_depth,
+                                                               desc.is_multisample, desc.is_integer)};
+            bool is_rescaled{};
+            for (u32 index = 0; index < desc.count; ++index) {
+                ImageView& image_view{texture_cache.GetImageView((view_it++)->id)};
+                Sampler& sampler{texture_cache.GetSampler(*(sampler_it++))};
+                const u32 image_slot{image_view.HeapSlot(heap, image_class, desc.type)};
+                const u32 sampler_slot{sampler.HeapSlotFor(heap, image_view, desc.is_depth)};
+                words.push_back(Shader::Bindless::PackSlots(image_slot, sampler_slot));
+                is_rescaled |= texture_cache.IsRescaling(image_view);
+            }
+            rescaled.push_back(is_rescaled ? 1 : 0);
+        }
+        view_it += Shader::NumDescriptors(info.image_descriptors);
+    }
+}
+
+/// PushImageDescriptors for a bindless pipeline's stage: its textures push only their rescaling
+/// bits (`rescaled`, from BuildBindlessTable) and `push_table` pushes the slot table in this
+/// stage's texture position when it is the table's stage; storage images are pushed as usual.
+template <typename PushTable>
+inline void PushBindlessImageDescriptors(TextureCache& texture_cache,
+                                         GuestDescriptorQueue& guest_descriptor_queue,
+                                         const Shader::Info& info, RescalingPushConstant& rescaling,
+                                         const VideoCommon::SamplerId*& samplers,
+                                         const VideoCommon::ImageViewInOut*& views,
+                                         const u8*& rescaled, PushTable&& push_table) {
+    views += Shader::NumDescriptors(info.texture_buffer_descriptors);
+    views += Shader::NumDescriptors(info.image_buffer_descriptors);
+    for (const auto& desc : info.texture_descriptors) {
+        views += desc.count;
+        samplers += desc.count;
+        rescaling.PushTexture(*(rescaled++) != 0);
+    }
+    push_table();
+    for (const auto& desc : info.image_descriptors) {
+        bool is_rescaled{};
+        for (u32 index = 0; index < desc.count; ++index) {
+            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            if (desc.is_written) {
+                texture_cache.MarkModification(image_view.image_id);
+            }
+            const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+            guest_descriptor_queue.AddImage(vk_image_view);
+            is_rescaled |= texture_cache.IsRescaling(image_view);
         }
         rescaling.PushImage(is_rescaled);
     }
