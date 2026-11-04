@@ -144,7 +144,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
 /// Number of Counter values (the enum is below; checked there).
-inline constexpr size_t CounterCount = 15;
+inline constexpr size_t CounterCount = 17;
 
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
@@ -208,6 +208,8 @@ enum class Counter : u32 {
     ListNoPage,     ///< ...not readable cheaply: the page has no copy entry yet
     ListDrawWritten, ///< ...not readable cheaply: draws wrote the page (copies only follow compute/copies)
     ListStale,      ///< ...not readable cheaply: written again since its copy, or outside it
+    SameTextures,   ///< Draws whose pipeline, image views and samplers match the previous draw
+    SameBuffers,    ///< Draws whose constant buffer, vertex and index bindings match the previous draw
     Count,
 };
 static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
@@ -301,7 +303,8 @@ inline void Report(const char* thread_name = "GPU thread") {
                           "download_bytes_on_dma_pages", "method_writes", "same_value_writes",
                           "acquire_checks",   "acquire_waits",     "draws",
                           "empty_draws",      "list_copied",       "list_synced",
-                          "list_no_page",     "list_draw_written", "list_stale"};
+                          "list_no_page",     "list_draw_written", "list_stale",
+                          "same_textures",    "same_buffers"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

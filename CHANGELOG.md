@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.12] - 2026-11-04
+
+### Added
+- NX2 profiler counters `same_textures` / `same_buffers`: draws whose pipeline, image views and
+  samplers (or constant buffer, vertex and index bindings) match the previous draw. In Donkey Kong
+  Bananza's open map 98% of draws repeat the texture side and ~3% the buffer side, which bounds what a
+  "same as the previous draw" fast path in `GraphicsPipeline::Configure` can skip.
+
+### Internal
+- The open map holds 18.8 fps after the benchmark turns away and back (measured 10 s after
+  recentring), the same as before turning: the higher number on screen is a smoothed counter.
+
 ## [0.1.11] - 2026-11-04
 
 ### Changed

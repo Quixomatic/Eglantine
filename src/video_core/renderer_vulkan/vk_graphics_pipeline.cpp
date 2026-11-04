@@ -498,6 +498,34 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
+    // Profiling: how often a draw's bindings repeat the previous draw's (for a fast path).
+    if (Profile::Enabled()) [[unlikely]] {
+        static u64 last_textures{}, last_buffers{};
+        const auto mix = [](u64 hash, u64 value) {
+            return (hash ^ value) * 0x100000001b3ULL;
+        };
+        u64 textures = mix(0xcbf29ce484222325ULL, reinterpret_cast<u64>(this));
+        for (const auto& view : views) {
+            textures = mix(textures, view.id.index);
+        }
+        for (const auto sampler : samplers) {
+            textures = mix(textures, sampler.index);
+        }
+        u64 buffers = 0xcbf29ce484222325ULL;
+        for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+            for (const auto& cbuf : maxwell3d->state.shader_stages[stage].const_buffers) {
+                buffers = mix(buffers, cbuf.enabled ? cbuf.address ^ (u64{cbuf.size} << 48) : 0);
+            }
+        }
+        for (const auto& stream : regs.vertex_streams) {
+            buffers = mix(buffers, stream.Address() ^ (u64{stream.stride.Value()} << 52));
+        }
+        buffers = mix(buffers, regs.index_buffer.StartAddress());
+        Profile::Add(Profile::Counter::SameTextures, textures == last_textures ? 1 : 0);
+        Profile::Add(Profile::Counter::SameBuffers, buffers == last_buffers ? 1 : 0);
+        last_textures = textures;
+        last_buffers = buffers;
+    }
 
     if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
         VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
