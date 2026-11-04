@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.9] - 2026-11-04
+
+Texture alias synchronization skips images whose aliases have not changed: Donkey Kong Bananza's
+open map 17.5 -> 18.7 fps (1% low 15.5 -> 16.5), rendering unchanged.
+
+### Changed
+- **`TextureCache::SynchronizeAliases` returns at once when no alias is newer.** It walked every
+  alias of an image each time a draw sampled it, comparing modification ticks, though almost none
+  had changed: ~7% of the GPU back thread in DK's open areas (host_profile). Each image now keeps
+  the newest modification tick among its aliases (raised when an alias is modified, added or
+  synchronized), so the walk only runs when there is something to copy.
+
 ## [0.1.8] - 2026-11-04
 
 Donkey Kong Bananza's GPU-culled draws are drawn by the host GPU straight from the records the culling
