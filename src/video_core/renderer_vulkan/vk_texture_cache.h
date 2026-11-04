@@ -23,6 +23,7 @@
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/renderer_vulkan/vk_texture_heap.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -247,6 +248,8 @@ public:
     } temporal_history;
 
     std::optional<ASTCDecoderPass> astc_decoder_pass;
+    /// The bindless texture heap, when the device enabled bindless textures.
+    std::unique_ptr<TextureHeap> texture_heap;
     std::optional<BcEncoderPass> bc_encoder_pass;
 
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
@@ -669,6 +672,12 @@ public:
         return *image_views[static_cast<size_t>(texture_type)];
     }
 
+    /// The bindless heap slot of this view sampled as `texture_type` through `image_class`
+    /// (0, the null descriptor, when the view has no such type).
+    [[nodiscard]] u32 HeapSlot(TextureHeap& heap, u32 image_class, Shader::TextureType texture_type) {
+        return heap_slots.Get(heap, image_class, Handle(Shader::Bindless::ViewTypeOf(texture_type)));
+    }
+
     [[nodiscard]] VkImage ImageHandle() const noexcept {
         return image_handle;
     }
@@ -739,6 +748,9 @@ private:
     bool requires_border_color_format = false;
     bool supports_minmax_filter = false;
     bool has_identity_swizzle = true;
+
+    /// Last member: released before the views above are destroyed.
+    TextureHeapSlots heap_slots;
 };
 
 class ImageAlloc : public VideoCommon::ImageAllocBase {};

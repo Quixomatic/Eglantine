@@ -969,6 +969,18 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
     }
 
+    /// Whether bindless textures (a global update-after-bind texture heap indexed by shaders)
+    /// were requested (EDEN_NX2_BINDLESS=1) and the device supports them; decided at creation,
+    /// which enables the descriptor indexing features they need.
+    bool IsBindlessTexturesEnabled() const {
+        return bindless_textures_enabled;
+    }
+
+    /// Descriptor indexing limits (update-after-bind descriptor counts).
+    const VkPhysicalDeviceDescriptorIndexingProperties& DescriptorIndexingProperties() const {
+        return properties.descriptor_indexing;
+    }
+
     bool HasTimelineSemaphore() const;
 
     /// Returns true if the device supports VK_KHR_synchronization2.
@@ -1242,6 +1254,7 @@ private:
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
+    bool bindless_textures_enabled{}; ///< See IsBindlessTexturesEnabled.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
     bool graphics_family_sparse_binding{};
@@ -1290,6 +1303,7 @@ private:
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
 
         VkPhysicalDeviceProperties properties{};
     };

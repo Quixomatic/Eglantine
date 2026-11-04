@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.23] - 2026-11-04
+
+Groundwork for bindless textures (inactive unless `EDEN_NX2_BINDLESS=1`; nothing samples from the
+heap yet). Design: a global texture heap indexed by shaders through a per-draw slot table.
+
+### Added
+- **Bindless device setup**: with `EDEN_NX2_BINDLESS=1` and a device that supports it, the
+  descriptor indexing features bindless needs (runtime descriptor arrays, update-after-bind sampled
+  images and samplers, update-unused-while-pending) stay enabled instead of being forced off, and
+  the descriptor indexing limits are read (`Device::IsBindlessTexturesEnabled`,
+  `DescriptorIndexingProperties`). It also needs partially bound bindings, non-uniform sampled image
+  indexing and robustness2 null descriptors.
+- **`TextureHeap`** (`vk_texture_heap.{h,cpp}`): one update-after-bind descriptor set with an array
+  of sampled images per image class (dimension x float/uint colour, multisample, depth: 24 classes,
+  `shader_recompiler/bindless.h`) and a sampler array. Slot 0 is a null descriptor; descriptors are
+  written when a slot is allocated; released slots are reused only after the GPU passes their
+  release tick. Image views own their slots (`TextureHeapSlots`, moved with the view, released in
+  its destructor); samplers keep theirs for the heap's lifetime.
+
 ## [0.1.22] - 2026-11-04
 
 Donkey Kong Bananza's indirect draw record resets are written to the host buffers in one batch:

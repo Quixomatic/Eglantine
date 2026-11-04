@@ -730,6 +730,34 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
+    // Bindless textures (EDEN_NX2_BINDLESS=1) keep the descriptor indexing features they need; the
+    // heap sizes its arrays from these limits (TextureHeap), which must hold at least its minimum.
+    {
+        const char* const value = std::getenv("EDEN_NX2_BINDLESS");
+        const bool requested = value != nullptr && value[0] != '0';
+        const auto& indexing = features.descriptor_indexing;
+        const auto& limits = properties.descriptor_indexing;
+        constexpr u32 min_images = 24 * 1024; // NUM_CLASSES * 1024
+        constexpr u32 min_samplers = 1024;
+        const bool supported =
+            indexing.runtimeDescriptorArray && indexing.descriptorBindingSampledImageUpdateAfterBind &&
+            indexing.descriptorBindingPartiallyBound &&
+            indexing.descriptorBindingUpdateUnusedWhilePending &&
+            indexing.shaderSampledImageArrayNonUniformIndexing && features.robustness2.nullDescriptor &&
+            limits.maxPerStageDescriptorUpdateAfterBindSampledImages >= min_images &&
+            limits.maxDescriptorSetUpdateAfterBindSampledImages >= min_images &&
+            limits.maxPerStageDescriptorUpdateAfterBindSamplers >= min_samplers &&
+            limits.maxDescriptorSetUpdateAfterBindSamplers >= min_samplers;
+        bindless_textures_enabled = requested && supported;
+        if (requested && !supported) {
+            LOG_WARNING(Render_Vulkan, "Bindless textures requested but not supported by the device");
+        } else if (bindless_textures_enabled) {
+            LOG_INFO(Render_Vulkan, "Bindless textures enabled (update-after-bind sampled images {}, samplers {})",
+                     limits.maxDescriptorSetUpdateAfterBindSampledImages,
+                     limits.maxDescriptorSetUpdateAfterBindSamplers);
+        }
+    }
+
     // Descriptors feature list
     {
         auto& descriptor_indexing = features.descriptor_indexing;
@@ -740,14 +768,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
         descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = false;
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = bindless_textures_enabled;
         descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = bindless_textures_enabled;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
-        descriptor_indexing.runtimeDescriptorArray = false;
+        descriptor_indexing.runtimeDescriptorArray = bindless_textures_enabled;
     }
 
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
@@ -1344,6 +1372,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
         SetNext(next, properties.custom_border_color);
+    }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
     }
 
     // Perform the property fetch.
