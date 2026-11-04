@@ -72,7 +72,9 @@ public:
     void WaitWorker();
 
     /// Sends currently recorded work to the worker thread.
-    void DispatchWork();
+    /// Sends the current chunk to the worker. A waiting worker is woken once a few chunks are
+    /// queued, or at once with force_wake (submissions and waits for the worker need it).
+    void DispatchWork(bool force_wake = false);
 
     /// Requests to begin a renderpass.
     void RequestRenderpass(const Framebuffer* framebuffer);

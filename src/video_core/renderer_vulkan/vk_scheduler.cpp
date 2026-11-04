@@ -135,7 +135,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
-    DispatchWork();
+    DispatchWork(true);
 
     // Ensure the queue is drained.
     {
@@ -147,18 +147,25 @@ void Scheduler::WaitWorker() {
     std::scoped_lock el{execution_mutex};
 }
 
-void Scheduler::DispatchWork() {
+void Scheduler::DispatchWork(bool force_wake) {
     if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
         VideoCommon::GpuSplit::CheckOwner("Scheduler::DispatchWork");
     }
     if (chunk && !chunk->Empty()) {
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
+        // An idle worker is woken for every few chunks (it records them in one go), and at once
+        // when something waits for it: one wake per dispatch was ~7% of DK Bananza's GPU back
+        // thread with the syscalls.
+        static const size_t WakeBatch = [] {
+            const char* value = std::getenv("EDEN_NX2_WAKE_BATCH");
+            return value != nullptr ? std::max<size_t>(1, std::strtoul(value, nullptr, 10)) : size_t{4};
+        }();
         bool wake;
         {
             std::scoped_lock ql{queue_mutex};
             work_queue.push(std::move(chunk));
-            wake = worker_waiting;
+            wake = worker_waiting && (force_wake || work_queue.size() >= WakeBatch);
         }
         if (wake) {
             event_cv.notify_all();
@@ -458,7 +465,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
     });
     chunk->MarkSubmit();
-    DispatchWork();
+    DispatchWork(true);
     return signal_value;
 }
 

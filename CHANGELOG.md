@@ -7,6 +7,18 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.10] - 2026-11-04
+
+Two per-draw costs off the GPU back thread: open map 18.7 -> 19.1 fps.
+
+### Changed
+- **The Vulkan worker is woken for every few command chunks, not each one.** An idle worker was
+  woken with a system call for each dispatch (one per few draws); it is now woken once 4 chunks are
+  queued, and at once for submissions, present and waits for the worker. `EDEN_NX2_WAKE_BATCH=<n>`
+  sets the batch (1 = the old behaviour; one run showed a lower 1% low facing away, unconfirmed).
+- **Buffer LRU touches check the buffer's own last touch tick first**, skipping the LRU pool lookup
+  (a cache miss per bound buffer per draw) when it was touched this frame already.
+
 ## [0.1.9] - 2026-11-04
 
 Texture alias synchronization skips images whose aliases have not changed: Donkey Kong Bananza's
