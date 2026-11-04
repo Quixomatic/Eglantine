@@ -315,9 +315,56 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
         }
     }
     const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
-    for (const u64 pointer : pointers) {
-        if (pointer) {
-            AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+    // Batched: guest memory per record here, the host buffers in one pass under one lock
+    // (BufferCache::InlineRecords). EDEN_NX2_RESET_BATCH=0 writes each record as an inline write.
+    static const bool batched = [] {
+        const char* value = std::getenv("EDEN_NX2_RESET_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!batched) {
+        for (const u64 pointer : pointers) {
+            if (pointer) {
+                AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+            }
+        }
+    } else {
+        reset_gpu_addresses.clear();
+        reset_device_addresses.clear();
+        reset_changed.clear();
+        reset_not_inlined.clear();
+        for (const u64 pointer : pointers) {
+            if (!pointer) {
+                continue;
+            }
+            const std::optional<DAddr> record_addr = gpu_memory->GpuToCpuAddress(pointer);
+            u8* const host = record_addr ? device_memory.GetPointer<u8>(*record_addr) : nullptr;
+            if (!record_addr || !host) {
+                AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+                continue;
+            }
+            // Checked above: the record lies in one mapping; a device page holds it whole
+            // unless it crosses one, where the slower path handles it.
+            if ((*record_addr & (Core::DEVICE_PAGESIZE - 1)) + bytes.size() > Core::DEVICE_PAGESIZE) {
+                AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+                continue;
+            }
+            const bool changed = std::memcmp(host, bytes.data(), bytes.size()) != 0;
+            if (changed) {
+                std::memcpy(host, bytes.data(), bytes.size());
+            }
+            // Pending query results must not land over the record later.
+            query_cache.InvalidateRegion(*record_addr, bytes.size());
+            reset_gpu_addresses.push_back(pointer);
+            reset_device_addresses.push_back(*record_addr);
+            reset_changed.push_back(changed ? 1 : 0);
+        }
+        buffer_cache.InlineRecords(reset_device_addresses, bytes, reset_not_inlined);
+        // Records the GPU had not written: CPU writes for every cache, at the next FlushCaching
+        // (none needed when the bytes were there already).
+        for (const size_t index : reset_not_inlined) {
+            if (reset_changed[index]) {
+                gpu_memory->AccumulateInvalidation(reset_gpu_addresses[index], bytes.size());
+            }
         }
     }
     static u32 reported{};

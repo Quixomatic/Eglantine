@@ -260,6 +260,14 @@ public:
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
 
+    /// Writes the same small record to many addresses (DK's indirect draw record resets) whose
+    /// buffer data the GPU wrote: one shared staging copy and one copy command per buffer instead
+    /// of InlineMemory's staging allocation and copy for each. Guest memory must hold the record
+    /// already. The indices of addresses whose data is not GPU-modified are appended to
+    /// `not_inlined`: the caller invalidates them as CPU writes. Takes the buffer cache's lock.
+    void InlineRecords(std::span<const DAddr> addresses, std::span<const u8> record,
+                       std::vector<size_t>& not_inlined);
+
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
     void DisableGraphicsUniformBuffer(size_t stage, u32 index);

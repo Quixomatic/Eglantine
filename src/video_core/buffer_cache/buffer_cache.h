@@ -2397,6 +2397,69 @@ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
 }
 
 template <class P>
+void BufferCache<P>::InlineRecords(std::span<const DAddr> addresses, std::span<const u8> record,
+                                   std::vector<size_t>& not_inlined) {
+    const u32 size = static_cast<u32>(record.size());
+    std::scoped_lock lock{mutex};
+    struct Group {
+        BufferId buffer_id;
+        boost::container::small_vector<BufferCopy, 64> copies;
+    };
+    boost::container::small_vector<Group, 4> groups;
+    for (size_t index = 0; index < addresses.size(); ++index) {
+        const DAddr address = addresses[index];
+        const DAddr page_begin = Common::AlignDown(address, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(address + size, DEVICE_PAGESIZE);
+        if (!IsRegionRegistered(address, size) ||
+            !IsRegionGpuModified(page_begin, page_end - page_begin)) {
+            not_inlined.push_back(index);
+            continue;
+        }
+        // As InlineMemoryImplementation: guest memory and the host buffer hold the same bytes
+        // now, so nothing older may be downloaded over them. The range is left in
+        // gpu_modified_ranges (equal bytes: a download is harmless) instead of carving a hole in
+        // it for every record, which the culling pass's next write fills again.
+        Nx2NoteListHostWrite(address, size);
+        ClearDownload(address, size);
+        MarkVertexBuffersStale(address, size);
+        if (groups.empty() || !slot_buffers[groups.back().buffer_id].IsInBounds(address, size)) {
+            const BufferId buffer_id = FindBuffer(address, size, false);
+            auto it = std::ranges::find(groups, buffer_id, &Group::buffer_id);
+            if (it == groups.end()) {
+                groups.push_back(Group{.buffer_id = buffer_id, .copies = {}});
+                it = groups.end() - 1;
+            } else if (it != groups.end() - 1) {
+                std::iter_swap(it, groups.end() - 1);
+            }
+        }
+        Group& group = groups.back();
+        group.copies.push_back(BufferCopy{
+            .src_offset = 0,
+            .dst_offset = slot_buffers[group.buffer_id].Offset(address),
+            .size = size,
+        });
+    }
+    for (Group& group : groups) {
+        Buffer& buffer = slot_buffers[group.buffer_id];
+        if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
+            // Every copy reads the same staged record.
+            auto upload_staging = runtime.UploadStagingBuffer(size);
+            std::memcpy(upload_staging.mapped_span.data(), record.data(), size);
+            for (BufferCopy& copy : group.copies) {
+                copy.src_offset = upload_staging.offset;
+            }
+            const std::span<BufferCopy> copies{group.copies.data(), group.copies.size()};
+            const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
+            runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
+        } else {
+            for (const BufferCopy& copy : group.copies) {
+                buffer.ImmediateUpload(copy.dst_offset, record);
+            }
+        }
+    }
+}
+
+template <class P>
 void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                                 std::span<const u8> inlined_buffer) {
     ClearDownload(dest_address, copy_size);

@@ -177,6 +177,11 @@ private:
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
     bool TryNx2IndirectReset();
+    /// TryNx2IndirectReset's per-reset scratch (kept to avoid allocating every reset).
+    std::vector<GPUVAddr> reset_gpu_addresses;
+    std::vector<DAddr> reset_device_addresses;
+    std::vector<u8> reset_changed;
+    std::vector<size_t> reset_not_inlined;
 
     void FlushWork();
 

@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.22] - 2026-11-04
+
+Donkey Kong Bananza's indirect draw record resets are written to the host buffers in one batch:
+open map 24.5 -> 25.0 fps (same build, switch off and on; 1% low 21.9 -> 22.2), rendering unchanged.
+
+### Changed
+- **Indirect record resets are batched** (`RasterizerVulkan::TryNx2IndirectReset`). Each reset
+  writes `{0, 1, 0, 0, 0}` to every record of a list; each record was an inline write of its own
+  (buffer cache lock, buffer lookup, staging allocation, copy command, and a hole carved in the
+  GPU-modified range set that the culling pass's next write filled again). Guest memory is now
+  written per record (skipped when it already holds the bytes) and `BufferCache::InlineRecords`
+  writes every GPU-written record under one lock from one 20-byte staging copy, with one
+  multi-region copy per buffer; records the GPU had not written are invalidated as CPU writes,
+  as before. The GPU back thread's `draw` zone went from 90 to 71 ms/s.
+  `EDEN_NX2_RESET_BATCH=0` writes each record as an inline write again.
+
 ## [0.1.21] - 2026-11-04
 
 Draws that hit the texture binding cache push their image descriptors from the cache: Donkey Kong
