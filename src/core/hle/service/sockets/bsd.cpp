@@ -167,6 +167,15 @@ void BSD_USA::StartMonitoring(HLERequestContext& ctx) {
     rb.Push(ResultSuccess);
 }
 
+void BSD_USA::Unknown36(HLERequestContext& ctx) {
+    // Sent once per session by nn::socket::Initialize (SDK 18+) right before StartMonitoring:
+    // in u32 (first word of the socket config) and the client pid, out u32 where non-zero fails
+    // the initialization.
+    IPC::ResponseBuilder rb{ctx, 3};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(0);
+}
+
 void BSD_USA::Socket(HLERequestContext& ctx) {
     IPC::RequestParser rp{ctx};
     const u32 domain = rp.Pop<u32>();
@@ -524,6 +533,12 @@ void BSD_USA::ExecuteWork(HLERequestContext& ctx, Work work) {
 }
 
 std::pair<s32, Errno> BSD_USA::SocketImpl(Domain domain, Type type, Protocol protocol) {
+    // The host network layer only speaks IPv4; refuse other families like a stack without them
+    // instead of asserting in the translation tables.
+    if (domain != Domain::Unspecified && domain != Domain::INET) {
+        return {-1, Errno::AFNOSUPPORT};
+    }
+
     // user bsd:u has restrictions on SOCK_SEQPACKET and SOCK_RAW
     if (is_user && (type == Type::SEQPACKET || type == Type::RAW)) {
         if (type == Type::RAW && domain == Domain::INET && protocol == Protocol::ICMP) {
@@ -1148,23 +1163,20 @@ BSD_USA::BSD_USA(Core::System& system_, const char* name, bool is_user_)
         {29, &BSD_USA::StubReplyZeroed, "RecvMMsg"}, //3.0.0+
         {30, &BSD_USA::StubReplyZeroed, "SendMMsg"}, //3.0.0+
         {31, &BSD_USA::EventFd, "EventFd"}, //7.0.0+
-        {32, &BSD_USA::StubReplyZeroed, "RegisterResourceStatisticsName"}, //7.0.0+
-        {33, &BSD_USA::StubReplyZeroed, "RegisterClientShared"}, //10.0.0+
-        {34, &BSD_USA::StubReplyZeroed, "GetSocketStatistics"}, //15.0.0+
-        {35, &BSD_USA::StubReplyZeroed, "NifIoctl"}, //17.0.0+
-        // Switch 2 titles register with 36 (16 bytes and the pid; a bsd errno back) instead of
-        // RegisterClient. The auto stub left the errno to the message buffer's leftovers, and
-        // Minecraft's socket layer failed later in EventFd.
-        {36, &BSD_USA::RegisterClient, "RegisterClientSwitch2"}, //18.0.0+
-        {37, &BSD_USA::StubReplyZeroed, "Unknown37"}, //18.0.0+
-        {38, &BSD_USA::StubReplyZeroed, "Unknown38"}, //18.0.0+
-        {39, &BSD_USA::StubReplyZeroed, "Unknown39"}, //20.0.0+
-        {40, &BSD_USA::StubReplyZeroed, "Unknown40"}, //20.0.0+
+        {32, nullptr, "RegisterResourceStatisticsName"}, //7.0.0+
+        {33, nullptr, "RegisterClientShared"}, //10.0.0+
+        {34, nullptr, "GetSocketStatistics"}, //15.0.0+
+        {35, nullptr, "NifIoctl"}, //17.0.0+
+        {36, &BSD_USA::Unknown36, "Unknown36"}, //18.0.0+
+        {37, nullptr, "Unknown37"}, //18.0.0+
+        {38, nullptr, "Unknown38"}, //18.0.0+
+        {39, nullptr, "Unknown39"}, //20.0.0+
+        {40, nullptr, "Unknown40"}, //20.0.0+
         {41, &BSD_USA::StubReplyEvent, "Unknown41"}, //21.0.0+
-        {42, &BSD_USA::StubReplyZeroed, "Unknown42"}, //21.0.0+
-        {43, &BSD_USA::StubReplyZeroed, "Unknown43"}, //21.0.0+
-        {200, &BSD_USA::StubReplyZeroed, "SetThreadCoreMask"}, //15.0.0+
-        {201, &BSD_USA::StubReplyZeroed, "GetThreadCoreMask"}, //15.0.0+
+        {42, nullptr, "Unknown42"}, //21.0.0+
+        {43, nullptr, "Unknown43"}, //21.0.0+
+        {200, nullptr, "SetThreadCoreMask"}, //15.0.0+
+        {201, nullptr, "GetThreadCoreMask"}, //15.0.0+
         {44, &BSD_USA::StubReplyZeroed, "Unknown44"},
     };
     // clang-format on

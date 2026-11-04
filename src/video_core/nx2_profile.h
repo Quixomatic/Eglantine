@@ -103,6 +103,7 @@ struct Snapshot {
     };
     std::vector<ZoneStat> zones;
     std::vector<std::pair<const char*, double>> counters;
+    std::vector<std::pair<const char*, double>> drains; ///< Split drains per second by site
 };
 
 /// Guards Snapshots(): Report writes under it from each profiled thread.
@@ -123,10 +124,30 @@ inline u64 Now() {
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
+/// Why the split's front waited for the back to run dry (GpuSplit::Drain), for the report.
+enum class DrainSite : u32 {
+    PbFlush,          ///< dma_pusher: macro parameters continued in their own entry (EDEN_NX2_PBFLUSH)
+    CommandSync,      ///< dma_pusher: command list sync (sync_memory_operations)
+    GpuWrittenParams, ///< dma_pusher: parameters on GPU-written pages
+    Front3D,          ///< maxwell_3d: front state created
+    FrontDmaRead,     ///< maxwell_3d: MME DMA read (indirect arguments)
+    FrontVerify,      ///< maxwell_3d: EDEN_NX2_SPLIT_VERIFY
+    FrontCompute,     ///< kepler_compute: front state created
+    Puller,           ///< puller: reads of what the back wrote
+    RingFull,         ///< the ring was full (the back is behind)
+    WriterWait,       ///< dma_pusher: partial wait for compute/copy work (GpuSplit::WaitForWriters)
+    Other,
+    Count,
+};
+inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
+    "pbflush", "command sync", "gpu-written params", "3d front init", "mme dma read",
+    "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
+
 struct ThreadData {
+    std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 10> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
@@ -177,7 +198,17 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    Draws,          ///< Direct draws reaching the rasterizer
+    EmptyDraws,     ///< Of Draws: zero vertices/indices or zero instances
+    Count,
 };
+
+/// Counts a drain that had to wait (the back still had work).
+inline void NoteDrain(DrainSite site) {
+    if (Enabled()) {
+        ++t_data.drains[static_cast<size_t>(site)];
+    }
+}
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
 /// while profiling): which buffer downloads anything on the GPU thread reads back.
@@ -239,13 +270,28 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    if (data.counters[8] != 0) {
+        line += fmt::format(" | draws {:.0f} ({:.0f} empty)",
+                            static_cast<double>(data.counters[8]) * 1e9 / window,
+                            static_cast<double>(data.counters[9]) * 1e9 / window);
+    }
+    std::string drains;
+    for (size_t i = 0; i < data.drains.size(); ++i) {
+        if (data.drains[i] != 0) {
+            drains += fmt::format("{}{} {:.0f}", drains.empty() ? "" : ", ", drain_site_names[i],
+                                  static_cast<double>(data.drains[i]) * 1e9 / window);
+        }
+    }
+    if (!drains.empty()) {
+        line += " | split drains/s by site: " + drains;
+    }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     {
-        static constexpr std::array<const char*, std::tuple_size_v<decltype(data.counters)>>
-            counter_names{"download_bytes",  "download_copies",
-                          "mme_dma_read_bytes", "download_bytes_on_dma_pages",
-                          "method_writes",   "same_value_writes",
-                          "acquire_checks",  "acquire_waits"};
+        static constexpr std::array<const char*, static_cast<size_t>(Counter::Count)>
+            counter_names{"download_bytes",   "download_copies",   "mme_dma_read_bytes",
+                          "download_bytes_on_dma_pages", "method_writes", "same_value_writes",
+                          "acquire_checks",   "acquire_waits",     "draws",
+                          "empty_draws"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
@@ -259,6 +305,12 @@ inline void Report(const char* thread_name = "GPU thread") {
         for (size_t i = 0; i < counter_names.size(); ++i) {
             snap.counters.emplace_back(counter_names[i],
                                        static_cast<double>(data.counters[i]) * per_s);
+        }
+        for (size_t i = 0; i < data.drains.size(); ++i) {
+            if (data.drains[i] != 0) {
+                snap.drains.emplace_back(drain_site_names[i],
+                                         static_cast<double>(data.drains[i]) * per_s);
+            }
         }
         std::scoped_lock lock{SnapshotMutex()};
         Snapshots()[thread_name] = std::move(snap);

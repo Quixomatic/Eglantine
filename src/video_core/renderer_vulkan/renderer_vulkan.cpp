@@ -22,6 +22,7 @@
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
@@ -196,6 +197,14 @@ try
     VideoCore::FxChain::Instance().LoadFromSettings();
 #endif
 
+    // AMD's Windows driver crashes (integer divide by zero in amdvlk64.dll) on the sparse images
+    // that lazily backed Switch 2 regions lead to, while Mario Kart World loads its map. Back those
+    // regions whole there, as before; EDEN_NX2_SPARSE_LAZY=1 still forces lazy backing.
+    if (device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY) {
+        Tegra::g_nx2_sparse_lazy_supported = false;
+        LOG_INFO(Render_Vulkan, "AMD proprietary driver: Switch 2 sparse regions are backed whole");
+    }
+
     Report();
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
@@ -363,9 +372,13 @@ void RendererVulkan::RenderAppletCaptureLayer(
             VideoCore::Capture::Layout, *applet_frame.image_view, CaptureFormat);
     }
 
+    // The capture is drawn every frame. With one set of layer resources each frame waited for
+    // the host GPU to finish the previous one; rotating through three lets the GPU thread stay
+    // ahead like the swapchain blit does.
+    constexpr size_t CaptureResourceSets = 3;
     scheduler.RequestOutsideRenderPassOperationContext();
-    blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
-                            CaptureFormat);
+    blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout,
+                            CaptureResourceSets, CaptureFormat);
 }
 
 } // namespace Vulkan

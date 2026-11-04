@@ -148,7 +148,9 @@ static void NotifyFatalCrash(Core::System& system, Result error_code, FatalType 
     std::vector<u64> trace;
     if (info.arch == FatalInfo::Architecture::AArch32) {
         FatalAarch32Context ctx32{};
-        std::memcpy(&ctx32, &info, sizeof(ctx32));
+        // Through void*: the struct has member initializers, which GCC's -Wclass-memaccess
+        // rejects for a typed memcpy destination.
+        std::memcpy(static_cast<void*>(&ctx32), &info, sizeof(ctx32));
         for (size_t i = 0; i < ctx32.r.size(); ++i) {
             context.r[i] = ctx32.r[i];
         }

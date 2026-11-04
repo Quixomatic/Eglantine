@@ -2378,19 +2378,32 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         QtCommon::system->ApplySettings();
     }
 
-    if (title_id == Settings::MarioKartWorldProgramId && !asked_recommended_mkw_settings) {
-        asked_recommended_mkw_settings = true;
-        use_recommended_mkw_settings =
-            QMessageBox::question(
-                this, tr("Recommended Mario Kart World settings"),
+    if (title_id == Settings::MarioKartWorldProgramId) {
+        auto& choice = UISettings::values.mkw_recommended_choice;
+        if (choice.GetValue() == 0) {
+            QMessageBox box(
+                QMessageBox::Question, tr("Recommended Mario Kart World settings"),
                 tr("Use the recommended settings for Mario Kart World?\n\n"
-                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
-                   "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
-                   "FXAA.\n\n"
-                   "They apply to Mario Kart World until Eglantine is closed. Your saved settings "
-                   "are not changed."),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
-        LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
+                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative "
+                   "VRAM, reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, "
+                   "and FXAA.\n\n"
+                   "Yes overrides your settings for this game only. No keeps them."),
+                QMessageBox::Yes | QMessageBox::No, this);
+            box.setDefaultButton(QMessageBox::No);
+            box.setEscapeButton(QMessageBox::No);
+            auto* remember = new QCheckBox(tr("Don't ask again"), &box);
+            box.setCheckBox(remember);
+            const bool yes = box.exec() == QMessageBox::Yes;
+            use_recommended_mkw_settings = yes;
+            if (remember->isChecked()) {
+                choice.SetValue(yes ? 1 : 2);
+                config->SaveAllValues();
+            }
+        } else {
+            use_recommended_mkw_settings = choice.GetValue() == 1;
+        }
+    } else {
+        use_recommended_mkw_settings = false;
     }
     if (Settings::ApplyMarioKartWorldPreset(Settings::values, title_id,
                                           use_recommended_mkw_settings)) {
@@ -4802,9 +4815,7 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
     static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
+    static const std::string yuzu_title = "Eglantine - PokeDinner fork by Franseven";
 
     const auto override_title =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);

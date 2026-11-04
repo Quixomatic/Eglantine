@@ -125,8 +125,9 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
         {230, &IApplicationFunctions::StubReplyZeroed, "Unknown230"},
         {300, &IApplicationFunctions::StubReplyInterface, "CreateMovieWriter"}, // [19.0.0+]
         {310, &IApplicationFunctions::StubReplyZeroed, "Unknown310"}, // [20.0.0+]
-        {320, D<&IApplicationFunctions::Unknown320>, "Unknown320"}, // [20.0.0+]
-        {321, D<&IApplicationFunctions::Unknown321>, "Unknown321"}, // Switch 2
+        {320, D<&IApplicationFunctions::GetScreenShotAndContinuousRecordingInitiallyEnabled>,
+         "GetScreenShotAndContinuousRecordingInitiallyEnabled"},
+        {321, D<&IApplicationFunctions::Unknown321>, "Unknown321"}, // NS2: u32 in, no out
         {330, D<&IApplicationFunctions::Unknown330>, "Unknown330"}, // [20.0.0+]
         {500, &IApplicationFunctions::StubReplyEvent, "StartContinuousRecordingFlushForDebug"},
         {1000, &IApplicationFunctions::StubReplyInterface, "CreateMovieMaker"},
@@ -576,18 +577,19 @@ Result IApplicationFunctions::GetOperationModeRefreshEvent(
     R_SUCCEED();
 }
 
-Result IApplicationFunctions::Unknown320(Out<u16> out) {
-    // Called by Switch 2 titles during nn::oe::Initialize. It returns two bytes of data (meaning
-    // unknown); a reply without them left the caller reading stale message words.
-    LOG_WARNING(Service_AM, "(STUBBED) called");
-    *out = 0;
+Result IApplicationFunctions::GetScreenShotAndContinuousRecordingInitiallyEnabled(
+    Out<bool> out_screenshot_enabled, Out<bool> out_recording_enabled) {
+    std::scoped_lock lk{m_applet->lock};
+    *out_screenshot_enabled = m_applet->screenshot_permission != ScreenshotPermission::Disable;
+    *out_recording_enabled = m_applet->game_play_recording_supported &&
+                             m_applet->game_play_recording_state == GamePlayRecordingState::Enabled;
+    LOG_DEBUG(Service_AM, "called, screenshot={}, recording={}", *out_screenshot_enabled,
+              *out_recording_enabled);
     R_SUCCEED();
 }
 
-Result IApplicationFunctions::Unknown321(Out<u8> out) {
-    // Called by Switch 2 titles right after 320; returns one byte (meaning unknown).
-    LOG_WARNING(Service_AM, "(STUBBED) called");
-    *out = 0;
+Result IApplicationFunctions::Unknown321(u32 in_val) {
+    LOG_WARNING(Service_AM, "(STUBBED) called, in_val={}", in_val);
     R_SUCCEED();
 }
 

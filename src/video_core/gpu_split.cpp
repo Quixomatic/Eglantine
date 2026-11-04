@@ -169,6 +169,7 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
+    Nx2Profile::NoteDrain(Nx2Profile::DrainSite::RingFull);
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -196,11 +197,12 @@ void GpuSplit::Publish() {
     }
 }
 
-void GpuSplit::Drain() {
+void GpuSplit::Drain(Nx2Profile::DrainSite site) {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
     }
+    Nx2Profile::NoteDrain(site);
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     for (u32 spins = 0;; ++spins) {
@@ -223,6 +225,7 @@ void GpuSplit::WaitForWriters() {
     if (consumed_cache >= target) {
         return;
     }
+    Nx2Profile::NoteDrain(Nx2Profile::DrainSite::WriterWait);
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     for (u32 spins = 0;; ++spins) {

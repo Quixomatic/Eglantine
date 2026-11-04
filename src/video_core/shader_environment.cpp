@@ -34,6 +34,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_vulkan/pipeline_stats.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -130,8 +131,9 @@ static void DumpImpl(u64 /*pipeline_hash*/, u64 shader_hash, std::span<const u64
 }
 
 GenericEnvironment::GenericEnvironment(Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
-                                       u32 start_address_)
-    : gpu_memory{&gpu_memory_}, program_base{program_base_} {
+                                       u32 start_address_, bool native_tensor_full_by_default_)
+    : gpu_memory{&gpu_memory_}, program_base{program_base_},
+      native_tensor_full_by_default{native_tensor_full_by_default_} {
     start_address = start_address_;
 }
 
@@ -381,8 +383,12 @@ private:
 // A native program is captured and lowered once, when the shader cache first meets it. The
 // environments built later for its pipelines receive that result instead of lowering again.
 void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
-                                              u32 source_header_size) {
+                                              u32 source_header_size, bool is_compute) {
     if (!lowered) {
+        const Vulkan::PipelineStats::ScopedTimer timer{
+            is_compute ? Vulkan::PipelineStats::Kind::Compute
+                       : Vulkan::PipelineStats::Kind::Graphics,
+            Vulkan::PipelineStats::Stage::Lower};
         lowered = LowerNativeCode(source_header_size);
     }
     if (lowered->texture_bound != ~0U) {
@@ -434,7 +440,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    const char* const tensor_override = std::getenv("EDEN_NX2_TENSOR");
+    const std::string_view tensor_mode =
+        tensor_override ? tensor_override : (native_tensor_full_by_default ? "full" : "");
+    auto lowered = Shader::Ampere::LowerToMaxwell(native, tensor_mode);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -544,8 +553,11 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          Tegra::MemoryManager& gpu_memory_,
                                          Maxwell::ShaderType program, GPUVAddr program_base_,
                                          u32 start_address_,
-                                         std::shared_ptr<const LoweredNativeCode> lowered_native_)
-    : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
+                                         std::shared_ptr<const LoweredNativeCode> lowered_native_,
+                                         bool native_tensor_full_by_default_)
+    : GenericEnvironment{gpu_memory_, program_base_, start_address_,
+                         native_tensor_full_by_default_},
+      maxwell3d{&maxwell3d_} {
     gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
@@ -557,8 +569,8 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                          (program == Maxwell::ShaderType::VertexB ||
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
-        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            !mesh_slot) {
+        if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Geometry &&
+            program != Maxwell::ShaderType::Pixel && !mesh_slot) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
@@ -625,11 +637,19 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
 }
 
 u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
-    const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
-    ASSERT(cbuf.enabled);
     u32 value{};
-    if (cbuf_offset < cbuf.size) {
-        value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+    if (snapshot) {
+        const auto& cbuf{snapshot->const_buffers[cbuf_index]};
+        ASSERT(cbuf.enabled);
+        if (cbuf_offset < cbuf.size) {
+            std::memcpy(&value, cbuf.bytes.data() + cbuf_offset, sizeof(value));
+        }
+    } else {
+        const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
+        ASSERT(cbuf.enabled);
+        if (cbuf_offset < cbuf.size) {
+            value = gpu_memory->Read<u32>(cbuf.address + cbuf_offset);
+        }
     }
     cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
     return value;
@@ -641,8 +661,9 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
         return std::nullopt;
     }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
-    auto it = maxwell3d->replace_table.find(key);
-    if (it == maxwell3d->replace_table.end()) {
+    const auto& replace_table{snapshot ? snapshot->replace_table : maxwell3d->replace_table};
+    auto it = replace_table.find(key);
+    if (it == replace_table.end()) {
         return std::nullopt;
     }
     const auto converted_value = [](Tegra::Engines::Maxwell3D::HLEReplacementAttributeType name) {
@@ -662,20 +683,14 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
 }
 
 Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
-    const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const auto entry{ReadTextureDescriptor(handle)};
     const Shader::TextureType result{ConvertTextureType(entry)};
     texture_types.emplace(handle, result);
     return result;
 }
 
 Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handle) {
-    const auto& regs{maxwell3d->regs};
-    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
-    auto entry =
-        ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit, via_header_index, handle);
+    const auto entry{ReadTextureDescriptor(handle)};
     const Shader::TexturePixelFormat result(ConvertTexturePixelFormat(entry));
     texture_pixel_formats.emplace(handle, result);
     return result;
@@ -687,17 +702,98 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 }
 
 u32 GraphicsEnvironment::ReadViewportTransformState() {
-    const auto& regs{maxwell3d->regs};
-    viewport_transform_state = regs.viewport_scale_offset_enabled;
+    viewport_transform_state = snapshot ? snapshot->viewport_scale_offset_enabled
+                                        : maxwell3d->regs.viewport_scale_offset_enabled;
     return viewport_transform_state;
+}
+
+Tegra::Texture::TICEntry GraphicsEnvironment::ReadTextureDescriptor(u32 handle) {
+    if (!snapshot) {
+        const auto& regs{maxwell3d->regs};
+        const bool via_header_index{regs.sampler_binding ==
+                                    Maxwell::SamplerBinding::ViaHeaderBinding};
+        return ReadTextureInfo(regs.tex_header.Address(), regs.tex_header.limit,
+                               via_header_index, handle);
+    }
+    const u32 index{Tegra::Texture::TexturePair(handle, snapshot->via_header_index).first};
+    ASSERT(index <= snapshot->texture_pool_limit);
+    Tegra::Texture::TICEntry entry{};
+    if (index <= snapshot->texture_pool_limit) {
+        // Only the pool's own range was checked to be contiguous: never read past it.
+        snapshot->device_memory->ReadBlockUnsafe(snapshot->texture_pool + index * sizeof(entry),
+                                                 &entry, sizeof(entry));
+    }
+    return entry;
+}
+
+// Runs on the GPU thread, before the environment is handed to a translation worker.
+// - Constant buffers are copied whole: translation folds some of their values into the shader
+//   (driver constants in bank 1, texture handles, indirect branch tables), and games reuse
+//   uniform memory once the GPU is past the draw, so a later read could see another draw's data.
+// - The texture pool is not copied, only located: its entries are read on the worker through
+//   the device address, unsynchronized. An entry rewritten in the meantime gives the newer
+//   texture type, an accepted risk (pools hold long-lived descriptors).
+// - The viewport transform flag and the HLE macro replacements are copied.
+bool GraphicsEnvironment::Detach(Tegra::MaxwellDeviceMemoryManager& device_memory) {
+    // A texture handle indexes at most 2^20 descriptors; a larger limit is not a real pool and
+    // would make the contiguity check below walk gigabytes of page table.
+    constexpr u32 MaxTexturePoolLimit = (1U << 20) - 1;
+    const auto& regs{maxwell3d->regs};
+    if (regs.tex_header.limit > MaxTexturePoolLimit) {
+        return false;
+    }
+    const GPUVAddr pool_address{regs.tex_header.Address()};
+    const size_t pool_size{(size_t{regs.tex_header.limit} + 1) * sizeof(Tegra::Texture::TICEntry)};
+    const std::optional<DAddr> pool_device_address{gpu_memory->GpuToCpuAddress(pool_address)};
+    if (!pool_device_address || !gpu_memory->IsContinuousRange(pool_address, pool_size)) {
+        return false;
+    }
+    EngineSnapshot copy;
+    const auto& live_buffers{maxwell3d->state.shader_stages[stage_index].const_buffers};
+    for (size_t index = 0; index < live_buffers.size(); ++index) {
+        const auto& live{live_buffers[index]};
+        auto& copied{copy.const_buffers[index]};
+        copied.enabled = live.enabled;
+        if (!live.enabled || live.size == 0) {
+            continue;
+        }
+        // The size register can exceed what a constant buffer holds; never copy more than that.
+        copied.size = (std::min)(live.size, static_cast<u32>(Maxwell::MaxConstBufferSize));
+        copied.bytes.resize(copied.size + sizeof(u32));
+        gpu_memory->ReadBlockUnsafe(live.address, copied.bytes.data(), copied.bytes.size());
+    }
+    copy.device_memory = &device_memory;
+    copy.texture_pool = *pool_device_address;
+    copy.texture_pool_limit = regs.tex_header.limit;
+    copy.via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    copy.viewport_scale_offset_enabled = regs.viewport_scale_offset_enabled;
+    if (has_hle_engine_state) {
+        copy.replace_table = maxwell3d->replace_table;
+    }
+    snapshot = std::move(copy);
+    maxwell3d = nullptr;
+    return true;
+}
+
+size_t GraphicsEnvironment::SnapshotSizeBytes() const noexcept {
+    if (!snapshot) {
+        return 0;
+    }
+    size_t total{};
+    for (const auto& cbuf : snapshot->const_buffers) {
+        total += cbuf.bytes.size();
+    }
+    return total;
 }
 
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                        u32 start_address_,
-                                       std::shared_ptr<const LoweredNativeCode> lowered_native_)
-    : GenericEnvironment{gpu_memory_, program_base_, start_address_}, kepler_compute{
-                                                                          &kepler_compute_} {
+                                       std::shared_ptr<const LoweredNativeCode> lowered_native_,
+                                       bool native_tensor_full_by_default_)
+    : GenericEnvironment{gpu_memory_, program_base_, start_address_,
+                         native_tensor_full_by_default_},
+      kepler_compute{&kepler_compute_} {
     const auto& qmd{kepler_compute->launch_description};
     stage = Shader::Stage::Compute;
     local_memory_size = qmd.local_pos_alloc + qmd.local_crs_alloc;
@@ -708,7 +804,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
-        InitializeNativeCode(std::move(lowered_native_), 0);
+        InitializeNativeCode(std::move(lowered_native_), 0, true);
         start_address = sizeof(sph);
     }
 }
