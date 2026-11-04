@@ -397,6 +397,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 last_store = read_position;
             }
         }
+        // Submit deferred work before handing the position back. A front that drained to this
+        // position runs back work itself next (fence releases record Vulkan commands): a
+        // deferred flush from the idle hook after that swapped the scheduler's command chunk
+        // under it (access violation in Scheduler::Record). Only the back defers, so with this
+        // the idle hook finds nothing to submit while the front owns the state.
+        if (idle_hook != nullptr) {
+            idle_hook(idle_argument);
+        }
         g_back_busy.store(false, std::memory_order_release);
         consumed.store(read_position, std::memory_order_release);
     }

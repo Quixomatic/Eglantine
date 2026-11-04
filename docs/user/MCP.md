@@ -19,7 +19,8 @@ The server is **off by default** and only listens on `127.0.0.1` (this PC).
 With the server on, agents can look at the emulator and boot, pause, resume and stop games. To let
 them write, also turn on **Tools > MCP Server > Allow Writes** (or start with
 `--mcp-allow-writes`). Writes are input (buttons, touch, TAS, routes), guest memory writes,
-settings and docked mode.
+breakpoints, settings (including A/B tests and shader dump switches) and docked mode. Booting,
+pausing, resuming, stopping and closing the emulator are not writes.
 
 While the server runs, the status bar shows `MCP :6544`, the agent in control, the last tool it
 called, and any route or recording in progress (red while recording). Hover it for details.
@@ -88,11 +89,13 @@ Agents can also use the emulator's own debugging features:
 - Optional `mcp_token` setting: when set, clients must send it as a bearer token.
 - Keys, console serials and the MCP's own security settings are never exposed to agents, and key
   material is masked in the log lines they read.
-- With Allow Writes off (the default), agents cannot send input, write memory or change settings.
+- With Allow Writes off (the default), agents cannot send input, write memory, set breakpoints or
+  change settings.
 
 ## What agents can do
 
-The full list of tools, with what each one does, is in
+Every tool, with its parameters and what it needs (Allow Writes, the control lease, a running
+game), is described in the [MCP Tool Reference](../MCP-tools.md). A shorter list is in
 [`tools/mcp/README.md`](../../tools/mcp/README.md). In short:
 
 | Area | Examples |

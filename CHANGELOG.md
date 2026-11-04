@@ -7,6 +7,27 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.6] - 2026-11-04
+
+Fixes an intermittent crash in Donkey Kong Bananza that came in with upstream's batched fence
+submissions, and documents every MCP tool.
+
+### Fixed
+- **Crash recording Vulkan commands with the GPU thread split** (access violation in
+  `Scheduler::Record`, about 2 of 3 benchmark runs). The back submitted deferred work from its idle
+  hook after it had told the front it was caught up; a front that drained to that point was recording
+  fence-release commands itself, and the deferred flush swapped the command chunk under it. The back
+  now submits deferred work at the end of each batch, before it publishes its position
+  (`gpu_split.cpp`). Six benchmark rounds and three stops ran clean; open map 14.4-14.7 fps.
+- MCP: `input_sequence` no longer says the TAS tools are "coming", and the server instructions say
+  that booting, pausing, stopping and quitting need only the control lease (writes are for input,
+  memory, settings and breakpoints).
+
+### Added
+- `docs/MCP-tools.md`: reference for all 98 MCP tools (parameters, gating, examples), linked from the
+  other MCP docs; the user handbook, command line page and `tools/mcp/README.md` corrected where they
+  disagreed with the code (Allow Writes scope, lease markers, prompts, discovery file contents).
+
 ## [0.1.5] - 2026-11-03
 
 Fixes the Linux release builds, which the v0.1.2 tag run failed.

@@ -24,6 +24,7 @@ This contains documentation created by developers, build instructions, guideline
   - **[HOS Kernel](./HosKernel.md)**
   - **[Settings](./Settings.md)**
   - **[MCP Server](./MCP.md)**
+  - **[MCP Tool Reference](./MCP-tools.md)**
 
 ## Policies
 
