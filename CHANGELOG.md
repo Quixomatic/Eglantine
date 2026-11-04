@@ -7,6 +7,24 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.7] - 2026-11-04
+
+A sampling profiler for the emulator's own threads, from the MCP, and fewer GPU-split drains for
+macro parameters on CPU-written pages.
+
+### Added
+- **MCP `host_profile`**: samples named host threads (GPU, GPUBack, CPUCore_*...) about 1000 times
+  a second and returns their hottest functions, callers and inclusive stacks, symbolized from the
+  PDB (Windows). eden-cli's `EDEN_NX2_SAMPLE` sampler moved to `common/host_sampler` and now backs
+  both.
+
+### Changed
+- **Macro parameters continued in their own entry drain the GPU split only when their pages are
+  GPU-written** (checked again after the queued compute and copy work ran, as for GPU-written
+  command entries). Games whose parameters are CPU-written no longer drain for each one. Donkey
+  Kong Bananza's are on GPU-written pages, so it is unchanged there (still about 15,000 drains a
+  second, now listed as `pbflush` instead of `other`); rendering checked against a baseline.
+
 ## [0.1.6] - 2026-11-04
 
 Fixes an intermittent crash in Donkey Kong Bananza that came in with upstream's batched fence

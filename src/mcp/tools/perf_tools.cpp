@@ -23,6 +23,7 @@
 
 #include <fmt/format.h>
 
+#include "common/host_sampler.h"
 #include "mcp/context.h"
 #include "mcp/timeline.h"
 #include "mcp/host.h"
@@ -358,7 +359,52 @@ ToolResult BaselineCheckTool(ToolContext& ctx, const json& args) {
 
 } // namespace
 
-/// Registers perf_sample, baseline_save, baseline_check and gpu_profile.
+/// Samples named host threads' call stacks (Common::HostSampler) and returns the hottest
+/// functions per thread: where it is, with its caller, and everything on its stack.
+ToolResult HostProfile(ToolContext&, const json& args) {
+    std::vector<std::string> patterns;
+    if (const auto it = args.find("threads"); it != args.end() && it->is_array()) {
+        for (const auto& name : *it) {
+            if (name.is_string()) {
+                patterns.push_back(name.get<std::string>());
+            }
+        }
+    }
+    if (patterns.empty()) {
+        patterns = {"GPU", "GPUBack"};
+    }
+    const double seconds = std::clamp(args.value("seconds", 5.0), 1.0, 30.0);
+    const size_t top = std::clamp<size_t>(args.value("top", size_t{25}), 1, 200);
+    const auto result = Common::HostSampler::Sample(patterns, seconds, top);
+    if (!result.error.empty()) {
+        return ToolResult::Error(result.error);
+    }
+    const auto rows = [](const std::vector<std::pair<std::string, unsigned>>& list,
+                         unsigned total) {
+        json out = json::array();
+        for (const auto& [name, count] : list) {
+            out.push_back({{"pct", std::round(1000.0 * count / std::max(total, 1U)) / 10},
+                           {"samples", count},
+                           {"function", name}});
+        }
+        return out;
+    };
+    json threads = json::array();
+    for (const auto& thread : result.threads) {
+        threads.push_back({{"thread", thread.name},
+                           {"samples", thread.samples},
+                           {"self", rows(thread.self, thread.samples)},
+                           {"self_caller", rows(thread.self_caller, thread.samples)},
+                           {"inclusive", rows(thread.inclusive, thread.samples)}});
+    }
+    json out{{"seconds", seconds}, {"threads", std::move(threads)}};
+    if (args.value("folded", false)) {
+        out["folded"] = result.folded;
+    }
+    return ToolResult::Structured(std::move(out));
+}
+
+/// Registers perf_sample, baseline_save, baseline_check, gpu_profile and host_profile.
 void RegisterPerfTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "perf_sample",
@@ -430,6 +476,27 @@ void RegisterPerfTools(ToolRegistry& registry) {
                          {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .handler = GpuProfile,
+    });
+    registry.Add(Tool{
+        .name = "host_profile",
+        .title = "Host thread sampling profiler",
+        .description =
+            "Which emulator functions a host thread spends its time in: pauses the named threads "
+            "about 1000 times a second for `seconds` (default 5), unwinds their stacks and "
+            "symbolizes them from the PDB. Per thread: self (where it is), self_caller (with "
+            "its caller) and inclusive (on the stack), as percentages of samples. threads are "
+            "host thread names as perf_sample's host_threads shows them, exact or prefix with "
+            "'*' (default GPU and GPUBack); folded:true adds every distinct stack for a flame "
+            "graph. Windows only. Finds the functions behind gpu_profile zones.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"threads", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+                           {"seconds", {{"type", "number"}, {"minimum", 1}, {"maximum", 30}}},
+                           {"top", {{"type", "integer"}, {"minimum", 1}, {"maximum", 200}}},
+                           {"folded", {{"type", "boolean"}}}}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true},
+        .handler = HostProfile,
     });
 }
 

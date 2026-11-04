@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "yuzu_cmd/nx2_sampler.h"
+#include "common/host_sampler.h"
+
+#include <cstdlib>
 
 #ifdef _WIN32
 
@@ -9,14 +11,12 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
-#include <string>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -25,12 +25,12 @@
 #include <tlhelp32.h>
 #include <dbghelp.h>
 
-namespace Nx2Sampler {
+namespace Common::HostSampler {
 namespace {
 
 constexpr size_t MaxDepth = 40;
 
-struct Sample {
+struct StackSample {
     unsigned thread;
     unsigned depth;
     std::array<DWORD64, MaxDepth> frames;
@@ -166,7 +166,9 @@ struct Symbolizer {
             return;
         }
         set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-        if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
+        // dbghelp keeps per-process state: initialize once and keep it for later samples.
+        static const bool initialized = initialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
+        if (!initialized) {
             from_address = nullptr;
         }
     }
@@ -205,27 +207,38 @@ struct Symbolizer {
     std::unordered_map<DWORD64, std::string> cache;
 };
 
-void Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
-            const char* path) {
-    Symbolizer symbolizer;
-    std::FILE* const file = std::fopen(path, "w");
-    if (file == nullptr) {
-        return;
+std::vector<std::pair<std::string, unsigned>> Sorted(const std::map<std::string, unsigned>& counts,
+                                                     size_t top) {
+    std::vector<std::pair<std::string, unsigned>> sorted(counts.begin(), counts.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    if (sorted.size() > top) {
+        sorted.resize(top);
     }
+    return sorted;
+}
+
+Result BuildResult(const std::vector<Target>& targets, const std::vector<StackSample>& samples,
+                   size_t top) {
+    // dbghelp is not thread safe: one report at a time.
+    static std::mutex dbghelp_mutex;
+    std::scoped_lock lock{dbghelp_mutex};
+    Symbolizer symbolizer;
+    Result result;
     for (unsigned thread = 0; thread < targets.size(); ++thread) {
         std::map<std::string, unsigned> self;
         std::map<std::string, unsigned> inclusive;
         std::map<std::string, unsigned> self_caller;
         unsigned total = 0;
-        for (const Sample& sample : samples) {
+        for (const StackSample& sample : samples) {
             if (sample.thread != thread || sample.depth == 0) {
                 continue;
             }
             ++total;
-            const std::string& top = symbolizer.Name(sample.frames[0]);
-            ++self[top];
+            const std::string& innermost = symbolizer.Name(sample.frames[0]);
+            ++self[innermost];
             if (sample.depth > 1) {
-                ++self_caller[top + "  <-  " + symbolizer.Name(sample.frames[1])];
+                ++self_caller[innermost + "  <-  " + symbolizer.Name(sample.frames[1])];
             }
             std::set<std::string> seen;
             for (unsigned i = 0; i < sample.depth; ++i) {
@@ -235,31 +248,11 @@ void Report(const std::vector<Target>& targets, const std::vector<Sample>& sampl
                 }
             }
         }
-        const auto print = [&](const char* title, const std::map<std::string, unsigned>& counts,
-                               size_t limit) {
-            std::vector<std::pair<unsigned, std::string>> sorted;
-            for (const auto& [name, count] : counts) {
-                sorted.emplace_back(count, name);
-            }
-            std::sort(sorted.rbegin(), sorted.rend());
-            std::fprintf(file, "-- %s\n", title);
-            for (size_t i = 0; i < (std::min)(limit, sorted.size()); ++i) {
-                std::fprintf(file, "%6u %5.1f%% %s\n", sorted[i].first,
-                             100.0 * sorted[i].first / (std::max)(total, 1U),
-                             sorted[i].second.c_str());
-            }
-        };
-        std::fprintf(file, "=== thread \"%s\": %u samples\n", targets[thread].name.c_str(), total);
-        print("self (where the thread is)", self, 60);
-        print("self <- caller", self_caller, 50);
-        print("inclusive (on the stack)", inclusive, 90);
-        std::fprintf(file, "\n");
+        result.threads.push_back({targets[thread].name, total, Sorted(self, top),
+                                  Sorted(self_caller, top), Sorted(inclusive, top)});
     }
-    std::fclose(file);
-
-    // <out>.folded: every distinct stack with its count, root first ("thread;a;b;c count").
     std::map<std::string, unsigned> folded;
-    for (const Sample& sample : samples) {
+    for (const StackSample& sample : samples) {
         std::string line = targets[sample.thread].name;
         for (unsigned i = sample.depth; i-- > 0;) {
             line += ';';
@@ -267,23 +260,45 @@ void Report(const std::vector<Target>& targets, const std::vector<Sample>& sampl
         }
         ++folded[line];
     }
-    if (std::FILE* const out = std::fopen((std::string{path} + ".folded").c_str(), "w")) {
-        for (const auto& [line, count] : folded) {
-            std::fprintf(out, "%s %u\n", line.c_str(), count);
+    for (const auto& [line, count] : folded) {
+        result.folded += line + ' ' + std::to_string(count) + '\n';
+    }
+    return result;
+}
+
+void WriteReport(const Result& result, const std::string& path) {
+    if (std::FILE* const file = std::fopen(path.c_str(), "w")) {
+        const auto print = [&](const char* title, const auto& rows, unsigned total) {
+            std::fprintf(file, "-- %s\n", title);
+            for (const auto& [name, count] : rows) {
+                std::fprintf(file, "%6u %5.1f%% %s\n", count,
+                             100.0 * count / (std::max)(total, 1U), name.c_str());
+            }
+        };
+        for (const ThreadReport& thread : result.threads) {
+            std::fprintf(file, "=== thread \"%s\": %u samples\n", thread.name.c_str(),
+                         thread.samples);
+            print("self (where the thread is)", thread.self, thread.samples);
+            print("self <- caller", thread.self_caller, thread.samples);
+            print("inclusive (on the stack)", thread.inclusive, thread.samples);
+            std::fprintf(file, "\n");
         }
+        std::fclose(file);
+    }
+    if (std::FILE* const out = std::fopen((path + ".folded").c_str(), "w")) {
+        std::fputs(result.folded.c_str(), out);
         std::fclose(out);
     }
 }
 
-void Run(std::vector<std::string> patterns, double start, double seconds, std::string out) {
-    std::this_thread::sleep_for(std::chrono::duration<double>(start));
+} // Anonymous namespace
+
+Result Sample(const std::vector<std::string>& patterns, double seconds, size_t top) {
     const std::vector<Target> targets = FindThreads(patterns);
-    std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling %.0f s\n", targets.size(),
-                 seconds);
     if (targets.empty()) {
-        return;
+        return {.error = "no host thread matches"};
     }
-    std::vector<Sample> samples;
+    std::vector<StackSample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
     while (std::chrono::steady_clock::now() < deadline &&
@@ -296,7 +311,7 @@ void Run(std::vector<std::string> patterns, double start, double seconds, std::s
             CONTEXT context{};
             context.ContextFlags = CONTEXT_FULL;
             if (GetThreadContext(handle, &context)) {
-                Sample& sample = samples.emplace_back();
+                StackSample& sample = samples.emplace_back();
                 sample.thread = i;
                 sample.depth = Walk(context, sample.frames);
             }
@@ -304,14 +319,12 @@ void Run(std::vector<std::string> patterns, double start, double seconds, std::s
         }
         Sleep(1);
     }
-    Report(targets, samples, out.c_str());
-    std::fprintf(stderr, "nx2 sampler: %zu samples written to %s\n", samples.size(), out.c_str());
+    Result result = BuildResult(targets, samples, top);
     for (const auto& target : targets) {
         CloseHandle(target.handle);
     }
+    return result;
 }
-
-} // Anonymous namespace
 
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
@@ -319,18 +332,29 @@ void StartFromEnvironment() {
         return;
     }
     const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
-    std::thread{Run, SplitNames(names), EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
-                EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
-                std::string{out != nullptr ? out : "nx2_samples.txt"}}
-        .detach();
+    std::thread{[patterns = SplitNames(names), start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
+                 seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
+                 path = std::string{out != nullptr ? out : "nx2_samples.txt"}] {
+        std::this_thread::sleep_for(std::chrono::duration<double>(start));
+        const Result result = Sample(patterns, seconds, 90);
+        if (!result.error.empty()) {
+            std::fprintf(stderr, "nx2 sampler: %s\n", result.error.c_str());
+            return;
+        }
+        WriteReport(result, path);
+        std::fprintf(stderr, "nx2 sampler: report written to %s\n", path.c_str());
+    }}.detach();
 }
 
-} // namespace Nx2Sampler
+} // namespace Common::HostSampler
 
 #else
 
-namespace Nx2Sampler {
+namespace Common::HostSampler {
+Result Sample(const std::vector<std::string>&, double, size_t) {
+    return {.error = "host sampling is only implemented on Windows"};
+}
 void StartFromEnvironment() {}
-} // namespace Nx2Sampler
+} // namespace Common::HostSampler
 
 #endif

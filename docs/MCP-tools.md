@@ -865,6 +865,24 @@ only time after the call (default when the call just enabled it).
 Parameters: `enable` (boolean), `window_ms` (1000 to 60000, default 10000), `fresh` (boolean),
 `top_zones` (0 to 64, 0 = all).
 
+### `host_profile`
+
+A sampling profiler for emulator host threads, for finding the functions behind a `gpu_profile`
+zone. It pauses the named threads about 1000 times a second, unwinds their stacks and symbolizes
+them from the PDB next to the executable. Per thread it returns `self` (the innermost function),
+`self_caller` (innermost function and its caller) and `inclusive` (every function on the stack),
+each as a percentage of that thread's samples. Thread names are the ones `perf_sample` lists under
+`host_threads`, matched exactly or by prefix with a trailing `*` (`CPUCore_*`). Windows only; it
+needs no game, writes or lease. The same sampler runs in eden-cli from `EDEN_NX2_SAMPLE`.
+
+Parameters: `threads` (array of names, default `["GPU", "GPUBack"]`), `seconds` (1 to 30,
+default 5), `top` (1 to 200 rows per list, default 25), `folded` (boolean: adds every distinct stack
+as `thread;outer;...;inner count` lines, for flame graphs).
+
+```json
+{"name": "host_profile", "arguments": {"threads": ["GPU", "GPUBack"], "seconds": 10}}
+```
+
 ### `baseline_save`
 
 Saves the current frame as a named known-good image for this game (PNG and fingerprint under

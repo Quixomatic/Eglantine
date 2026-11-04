@@ -68,6 +68,8 @@ add_library(
     hex_util.cpp
     hex_util.h
     host_memory.cpp
+    host_sampler.cpp
+    host_sampler.h
     host_memory.h
     input.h
     intrusive_red_black_tree.h

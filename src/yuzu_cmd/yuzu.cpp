@@ -59,7 +59,7 @@
 #endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
-#include "yuzu_cmd/nx2_sampler.h"
+#include "common/host_sampler.h"
 #ifdef YUZU_ENABLE_MCP
 #include "mcp/server.h"
 #include "yuzu_cmd/mcp_host_cli.h"
@@ -446,7 +446,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     SetUnhandledExceptionFilter(WriteCrashDump);
     InstallAbortReporting();
 #endif
-    Nx2Sampler::StartFromEnvironment();
+    Common::HostSampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");

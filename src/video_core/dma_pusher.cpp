@@ -136,19 +136,32 @@ bool DmaPusher::Step() {
                     return value == nullptr || value[0] != '0';
                 }();
                 bool flushed_parameters = false;
-                if (flush_parameters && words <= 64) {
-                    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-                        split.Drain();
+                const GPUVAddr param_address = dma_state.dma_get;
+                const size_t param_bytes = words * sizeof(u32);
+                // With the split, drain only for words on pages GPU work wrote: a drain per macro
+                // whose parameters continue in their own entry was ~15,000 a second in DK
+                // Bananza's open areas, nearly all of them on CPU-written pages, and each one
+                // stopped the front until the back caught up. The back marks pages as it runs
+                // the work that writes them, so a page still unmarked is checked again after the
+                // queued compute and copy work ran (as for GPU-written command entries).
+                bool may_be_gpu_written = true;
+                if (auto& split = VideoCommon::GpuSplit::Get(); flush_parameters && words <= 64 && split.Active()) {
+                    may_be_gpu_written = IsGpuWrittenCommands(param_address, param_bytes);
+                    if (!may_be_gpu_written && split.WaitForWriters()) {
+                        may_be_gpu_written = IsGpuWrittenCommands(param_address, param_bytes);
                     }
-                    const GPUVAddr address = dma_state.dma_get;
-                    const size_t bytes = words * sizeof(u32);
-                    if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
-                        memory_manager.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
+                    if (may_be_gpu_written) {
+                        split.Drain(VideoCommon::Nx2Profile::DrainSite::PbFlush);
+                    }
+                }
+                if (flush_parameters && words <= 64 && may_be_gpu_written) {
+                    if (memory_manager.IsMemoryDirty(param_address, param_bytes, VideoCommon::CacheType::BufferCache)) {
+                        memory_manager.FlushRegion(param_address, param_bytes, VideoCommon::CacheType::BufferCache);
                         flushed_parameters = true;
                         static std::atomic<u32> flush_logs{};
                         if (flush_logs.fetch_add(1) < 20) {
                             LOG_INFO(HW_GPU, "Macro parameters at {:#x} ({} words) were written by the GPU: flushed",
-                                     address, words);
+                                     param_address, words);
                         }
                     }
                 }
