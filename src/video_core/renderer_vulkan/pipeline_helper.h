@@ -496,8 +496,7 @@ inline void BuildBindlessTable(TextureCache& texture_cache, TextureHeap& heap,
                 ImageView& image_view{texture_cache.GetImageView((view_it++)->id)};
                 Sampler& sampler{texture_cache.GetSampler(*(sampler_it++))};
                 const u32 image_slot{image_view.HeapSlot(heap, image_class, desc.type)};
-                const u32 sampler_slot{
-                    heap.SamplerSlot(sampler.HandleFor(image_view, desc.is_depth))};
+                const u32 sampler_slot{sampler.HeapSlotFor(heap, image_view, desc.is_depth)};
                 words.push_back(Shader::Bindless::PackSlots(image_slot, sampler_slot));
                 is_rescaled |= texture_cache.IsRescaling(image_view);
             }

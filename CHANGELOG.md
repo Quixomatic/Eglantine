@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.25] - 2026-11-04
+
+Bindless follow-up and a descriptor path diagnostic. Bindless stays off by default: on Donkey Kong
+Bananza it is still ~0.5 fps behind the classic path (same build, two rounds: 25.1 / 25.3 vs 24.8 /
+24.7 fps; `configure` 124 vs 132 ms/s on the GPU back thread), with identical rendering.
+
+### Changed
+- Bindless sampler slots are kept in each sampler variant after the first lookup
+  (`Sampler::HeapSlotFor`) instead of a locked map lookup per texture on every slot table build.
+
+### Added
+- Diagnostics: the first graphics pipelines log their descriptor path (push descriptors,
+  descriptor buffer or pooled sets, and whether bindless); `EDEN_NX2_FORCE_SETS=1` forces pooled
+  sets to compare paths. On the test machine both classic and bindless pipelines use push
+  descriptors; forcing pooled sets costs ~0.8 fps.
+
 ## [0.1.24] - 2026-11-04
 
 Bindless textures work end to end (still off by default: `EDEN_NX2_BINDLESS=1`). Donkey Kong

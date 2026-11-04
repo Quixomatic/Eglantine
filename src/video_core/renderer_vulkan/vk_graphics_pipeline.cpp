@@ -321,6 +321,24 @@ GraphicsPipeline::GraphicsPipeline(
     // The heap is a classic descriptor set, which descriptor buffer pipelines cannot bind.
     uses_descriptor_buffer = !texture_heap && builder.CanUseDescriptorBuffer() &&
                              descriptor_buffer_ring.IsValid();
+    // Diagnostics: EDEN_NX2_FORCE_SETS=1 binds every graphics pipeline with pooled descriptor
+    // sets (to compare descriptor paths); the first pipelines log which path they took.
+    static const bool force_sets = [] {
+        const char* value = std::getenv("EDEN_NX2_FORCE_SETS");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (force_sets) {
+        uses_push_descriptor = false;
+        uses_descriptor_buffer = false;
+    }
+    static std::atomic<u32> reported_paths{};
+    if (reported_paths.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LOG_INFO(Render_Vulkan, "Graphics pipeline descriptors: {}{}",
+                 uses_descriptor_buffer ? "descriptor buffer"
+                 : uses_push_descriptor ? "push descriptors"
+                                        : "pooled sets",
+                 texture_heap ? " (bindless)" : "");
+    }
     descriptor_set_layout =
         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
     if (uses_descriptor_buffer) {

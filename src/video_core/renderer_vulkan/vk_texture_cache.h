@@ -785,6 +785,9 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    /// The bindless heap slot of HandleFor's variant, kept in the variant after the first lookup.
+    [[nodiscard]] u32 HeapSlotFor(TextureHeap& heap, const ImageView& image_view, bool is_depth);
+
 private:
     struct VariantKey {
         bool reduce_anisotropy;
@@ -804,6 +807,7 @@ private:
     struct Variant {
         VariantKey key;
         vk::Sampler sampler;
+        u32 heap_slot{}; ///< Bindless heap slot, 0 until first used
     };
 
     static constexpr size_t MAX_VARIANTS = 32;

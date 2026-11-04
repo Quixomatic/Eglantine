@@ -4395,6 +4395,19 @@ VkSampler Sampler::Emplace(VariantKey key) {
     return *variants.back().sampler;
 }
 
+u32 Sampler::HeapSlotFor(TextureHeap& heap, const ImageView& image_view, bool is_depth) {
+    const VkSampler handle{HandleFor(image_view, is_depth)};
+    for (Variant& variant : variants) {
+        if (*variant.sampler == handle) {
+            if (variant.heap_slot == 0) {
+                variant.heap_slot = heap.SamplerSlot(handle);
+            }
+            return variant.heap_slot;
+        }
+    }
+    return heap.SamplerSlot(handle);
+}
+
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
     VariantKey key = MakeKey(image_view, is_depth);
     if (variants.size() >= MAX_VARIANTS) {
