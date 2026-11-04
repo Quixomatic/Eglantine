@@ -5,6 +5,7 @@
 
 #include <fmt/format.h>
 
+#include "mcp/activity.h"
 #include "mcp/context.h"
 #include "mcp/control.h"
 #include "mcp/host.h"
@@ -88,6 +89,19 @@ ToolResult ReleaseControl(ToolContext& ctx, const json&) {
 
 /// quit_emulator: asks the frontend to close. The close is asynchronous, so the reply is sent
 /// before the window (and this server) goes away.
+ToolResult SetActivity(ToolContext&, const json& args) {
+    std::string text = args.value("text", "");
+    if (text.size() > 120) {
+        text.resize(120);
+    }
+    Activity::Get().Update([&](ActivityState& state) {
+        state.agent_activity = text;
+        state.agent_activity_time = std::chrono::steady_clock::now();
+    });
+    return ToolResult::Text(text.empty() ? "Activity cleared."
+                                         : fmt::format("Activity shown: {}", text));
+}
+
 ToolResult QuitEmulator(ToolContext& ctx, const json&) {
     if (!ctx.host) {
         return ToolResult::Error("no frontend host");
@@ -136,6 +150,21 @@ void RegisterControlTools(ToolRegistry& registry) {
         .description = "Give up the control lease so other agents can drive the emulator.",
         .annotations = {.idempotent = true},
         .handler = ReleaseControl,
+    });
+    registry.Add(Tool{
+        .name = "set_activity",
+        .title = "Say what you are doing",
+        .description = "Show a short description of what you are doing right now (e.g. \"measuring "
+                       "with the key gate on\") in the emulator's status bar, so the person watching "
+                       "knows. Call again to change it at any time; an empty text clears it.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"text", {{"type", "string"}, {"maxLength", 120},
+                                     {"description", "What you are doing; empty clears it."}}}}},
+                         {"required", {"text"}},
+                         {"additionalProperties", false}},
+        .annotations = {.idempotent = true},
+        .handler = SetActivity,
     });
     registry.Add(Tool{
         .name = "quit_emulator",

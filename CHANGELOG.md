@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.29] - 2026-11-04
+
+An MCP tool that shows what the agent is doing in the status bar, and a fix for a per-draw cost the
+draw merging of 0.1.28 added.
+
+### Added
+- **MCP `set_activity`**: a short text ("measuring with the key gate on") shown in the emulator's
+  MCP status bar label as "doing: ..." (and in its tooltip with how long ago it was set), changeable
+  at any time; an empty text clears it. Documented in `docs/MCP-tools.md`.
+
+### Fixed
+- **Every draw allocated memory when it was recorded alone.** Since 0.1.28 each draw is held back
+  for merging and then recorded through the batch path, which copied the batch into a heap vector
+  even for a single draw (every draw in Donkey Kong Bananza, ~165k a second). A single draw is now
+  recorded as a plain draw. Open map 24.3 -> 24.8 fps (1% low 21.0 -> 22.1).
+
 ## [0.1.28] - 2026-11-04
 
 Draw merging (plan C): consecutive draws of identical state are recorded as one multi-draw, and a

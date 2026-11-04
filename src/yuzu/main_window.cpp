@@ -930,6 +930,9 @@ void MainWindow::UpdateMcpStatusLabel() {
                      .arg(a.route_total)
                      .arg(QString::fromStdString(a.route_state));
     }
+    if (!a.agent_activity.empty()) {
+        parts << tr("doing: %1").arg(QString::fromStdString(a.agent_activity));
+    }
     if (active) {
         parts << tr("last: %1").arg(QString::fromStdString(a.last_tool));
     }
@@ -949,6 +952,14 @@ void MainWindow::UpdateMcpStatusLabel() {
     }
     if (!a.route_detail.empty()) {
         tip += QStringLiteral("\n") + QString::fromStdString(a.route_detail);
+    }
+    if (!a.agent_activity.empty()) {
+        const auto since_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now() - a.agent_activity_time)
+                                 .count();
+        tip += tr("\nAgent: %1 (set %2 s ago)")
+                   .arg(QString::fromStdString(a.agent_activity))
+                   .arg(since_s);
     }
     tip += tr("\nDashboard: %1").arg(QString::fromStdString(s.url.substr(0, s.url.size() - 3)));
     mcp_status_label->setToolTip(tip);

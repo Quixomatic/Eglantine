@@ -992,6 +992,7 @@ Parameters: `prefix` (must start with `EDEN_`).
 | `control_status` | - |
 | `acquire_control` | - |
 | `release_control` | - |
+| `set_activity` | - |
 
 ### `control_status`
 
@@ -1008,3 +1009,11 @@ default 120).
 ### `release_control`
 
 Gives up the lease. The lease is also released when the session ends. No parameters.
+
+### `set_activity`
+
+Shows a short description of what the agent is doing right now ("measuring with the key gate on")
+in the emulator's status bar (`doing: ...`, with the time it was set in the tooltip), so the person
+watching knows. Call it again to change it at any time; an empty `text` clears it.
+
+Parameters: `text` (up to 120 chars).

@@ -31,6 +31,10 @@ struct ActivityState {
     size_t route_total = 0;
     std::string route_detail; ///< e.g. "waiting for checkpoint 3"
     std::chrono::steady_clock::time_point route_changed{}; ///< Last state change (UIs fade "done")
+
+    /// What the agent says it is doing (set_activity), shown in the status bar until changed.
+    std::string agent_activity;
+    std::chrono::steady_clock::time_point agent_activity_time{};
 };
 
 /// Process-wide holder of the current ActivityState, guarded by a mutex.

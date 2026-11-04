@@ -157,6 +157,16 @@ void Scheduler::FlushPendingDraws() {
     case PendingDraws::Kind::None:
         return;
     case PendingDraws::Kind::Draw: {
+        if (pending.draws.size() == 1) {
+            // The usual case: a plain draw, no allocation.
+            const VkMultiDrawInfoEXT draw{pending.draws.front()};
+            pending.draws.clear();
+            Record([draw, instances = pending.instance_count,
+                    first_instance = pending.first_instance](vk::CommandBuffer cmdbuf) {
+                cmdbuf.Draw(draw.vertexCount, instances, draw.firstVertex, first_instance);
+            });
+            return;
+        }
         std::vector<VkMultiDrawInfoEXT> draws(pending.draws.begin(), pending.draws.end());
         pending.draws.clear();
         Record([draws = std::move(draws), instances = pending.instance_count,
@@ -173,6 +183,16 @@ void Scheduler::FlushPendingDraws() {
         return;
     }
     case PendingDraws::Kind::DrawIndexed: {
+        if (pending.indexed_draws.size() == 1) {
+            const VkMultiDrawIndexedInfoEXT draw{pending.indexed_draws.front()};
+            pending.indexed_draws.clear();
+            Record([draw, instances = pending.instance_count,
+                    first_instance = pending.first_instance](vk::CommandBuffer cmdbuf) {
+                cmdbuf.DrawIndexed(draw.indexCount, instances, draw.firstIndex, draw.vertexOffset,
+                                   first_instance);
+            });
+            return;
+        }
         std::vector<VkMultiDrawIndexedInfoEXT> draws(pending.indexed_draws.begin(),
                                                      pending.indexed_draws.end());
         pending.indexed_draws.clear();
