@@ -7,6 +7,38 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.30] - 2026-11-04
+
+A cheaper register write path on the GPU back thread: Donkey Kong Bananza's open map 24.8 -> 25.3 fps
+(~170k -> ~173k draws a second; one run each, so close to noise), rendering unchanged (baseline 0.952).
+
+### Changed
+- **The GPU split's fields no longer share cache lines between its threads.** `write_position`, which
+  the front writes for every entry, shared a line with `ring` and `system`, which the back reads for
+  every entry: the back took a cross-core cache miss to read two pointers that never change.
+- **`Maxwell3D::CallMethodRun` runs a batch of macro writes in one call**, with plain state writes
+  inline instead of one virtual `CallMethod` each, and prefetches the ring words ahead (the front wrote
+  them on another core). Macros, executable methods and shadow RAM control still take `CallMethod`.
+- The binding skip of 0.1.28 compares against the previous draw's entries where they already are in
+  the descriptor queue, instead of copying every draw's payload.
+
+### Added
+- Profiler counters `uniform_new_address`, `uniform_clean`, `uniform_stream_written`,
+  `uniform_unexplained` (small uniform binds; DK: 24% / 71% / 4.5% / 0%: its CPU never changes a
+  uniform buffer that stays at the same address).
+
+### Removed
+- The `EDEN_NX2_REG_HISTOGRAM` diagnostic of 0.1.27 (a check on every register write).
+
+### Internal
+- Known issue: one benchmark run ended with a failed `stop` (no details kept; the process had gone
+  afterwards). A later run under ProcDump hung: the game panicked in its audio thread during shutdown
+  (`Userspace PANIC`, 2010-0212), the emulation thread missed its 11 s limit, and
+  `MainWindow::TerminateEmulationThread` deadlocked inside `QThread::terminate` (the `finished` signal
+  reaches `OnEmulationStopped`, whose `isRunning` waits on a mutex terminate holds). ProcDump slows the
+  process, so that run may not be the same failure. A run without it stopped in 1.1 s with no panic.
+  `.plans/dk-perf-scripts/stop_cycles.sh` and `sample_stop.py` help diagnose it if it comes back.
+
 ## [0.1.29] - 2026-11-04
 
 An MCP tool that shows what the agent is doing in the status bar, and a fix for a per-draw cost the

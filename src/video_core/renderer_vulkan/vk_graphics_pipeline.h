@@ -220,7 +220,7 @@ private:
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     /// What the last recorded draw of this pipeline bound (C: an identical next draw records
     /// nothing while that draw is still pending in the scheduler).
-    std::vector<DescriptorUpdateEntry> recorded_payload;
+    const DescriptorUpdateEntry* recorded_payload{};
     std::remove_cvref_t<decltype(std::declval<RescalingPushConstant>().Data())> recorded_rescaling{};
     std::array<f32, 4> recorded_render_area{};
     bool recorded_render_area_used{};

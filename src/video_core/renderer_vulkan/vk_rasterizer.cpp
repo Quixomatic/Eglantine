@@ -351,6 +351,7 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
             const bool changed = std::memcmp(host, bytes.data(), bytes.size()) != 0;
             if (changed) {
                 std::memcpy(host, bytes.data(), bytes.size());
+                VideoCommon::Nx2Profile::NoteStreamWrite(*record_addr, bytes.size());
             }
             // Pending query results must not land over the record later.
             query_cache.InvalidateRegion(*record_addr, bytes.size());
@@ -1726,6 +1727,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     if (!same_bytes) {
         gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+        VideoCommon::Nx2Profile::NoteStreamWrite(*cpu_addr, copy_size);
     }
     // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
     static const bool defer = [] {

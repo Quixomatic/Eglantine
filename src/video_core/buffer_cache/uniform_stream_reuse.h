@@ -52,6 +52,8 @@ public:
         Ref ref{};
         u64 tick{};
         u32 size{}; // 0: nothing streamed yet
+        u64 device_addr{};        // Profiling only: the previous bind's address
+        u32 stream_generation{};  // Profiling only: g_stream_write_generation at the previous bind
         // A CPU copy on purpose: the stream allocation is upload (write-combined) memory, and
         // comparing against it instead made reads so slow DK Bananza ran at 1.7 fps.
         std::array<u8, MaxBytes> bytes{};
@@ -121,6 +123,19 @@ template <class Runtime, class DeviceMemory>
 
     const bool same_bytes =
         slot.size == size && std::memcmp(slot.bytes.data(), source, size) == 0;
+    if (Nx2Profile::Enabled()) [[unlikely]] {
+        if (slot.device_addr != device_addr || slot.size != size) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformNewAddress, 1);
+        } else if (Nx2Profile::LastStreamWrite(device_addr, size) > slot.stream_generation) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformStreamWritten, 1);
+        } else if (same_bytes) {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformClean, 1);
+        } else {
+            Nx2Profile::Add(Nx2Profile::Counter::UniformUnexplained, 1);
+        }
+        slot.device_addr = device_addr;
+        slot.stream_generation = Nx2Profile::g_stream_write_generation;
+    }
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
         Nx2Profile::Add(Nx2Profile::Counter::UniformReused, 1);

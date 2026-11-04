@@ -334,11 +334,7 @@ size_t GpuSplit::Execute(const u64* entry) {
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         // Only Method entries feed the sink: one check covers the run.
         engine->ConsumeSink(*system);
-        for (size_t i = 1; i <= count; ++i) {
-            const u64 word = entry[i];
-            engine->CallMethod(*system, static_cast<u32>((word >> 8) & 0xffff),
-                               static_cast<u32>(word >> 32), true);
-        }
+        engine->CallMethodRun(*system, entry + 1, count);
         return 1 + count;
     }
     case Kind::Call: {

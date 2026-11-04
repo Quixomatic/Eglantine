@@ -549,6 +549,11 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
         }
     }
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::CbWritten, 1);
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        if (const auto device = GpuToCpuAddress(gpu_dest_addr)) {
+            VideoCommon::Nx2Profile::NoteStreamWrite(*device, size);
+        }
+    }
     WriteBlockImpl(gpu_dest_addr, src_buffer, size, VideoCommon::CacheType::None, true);
     accumulator.Add(gpu_dest_addr, size);
 }

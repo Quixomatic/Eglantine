@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -144,7 +145,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
 /// Number of Counter values (the enum is below; checked there).
-inline constexpr size_t CounterCount = 35;
+inline constexpr size_t CounterCount = 39;
 
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
@@ -228,6 +229,10 @@ enum class Counter : u32 {
     MergeContiguous, ///< ...indirect, reading the record right after the previous draw's
     MergedDraws,    ///< Draws recorded as part of the previous draw's multi-draw (Scheduler)
     SkippedBindings, ///< Draws that recorded no descriptor/push constant/pipeline bind (unchanged)
+    UniformNewAddress, ///< Small uniform binds of another address than the slot's previous bind
+    UniformClean,   ///< ...same address, no command stream write to it, same bytes (compare wasted)
+    UniformStreamWritten, ///< ...same address, a command stream write to it since the last bind
+    UniformUnexplained, ///< ...same address, no command stream write, new bytes (CPU or other)
     Count,
 };
 static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
@@ -249,6 +254,29 @@ inline std::unordered_set<u64>& DmaReadPages() {
 /// This thread's running total of a counter (for deltas around a piece of work).
 [[nodiscard]] inline u64 CounterValue(Counter counter) {
     return t_data.counters[static_cast<size_t>(counter)];
+}
+
+/// Uniform measurement: the generation of the latest command stream write to each device page
+/// (hashed; a collision only counts a write that did not happen). Filled only while profiling.
+inline u32 g_stream_write_generation{};
+inline std::array<u32, 1u << 16> g_stream_write_pages{};
+
+inline void NoteStreamWrite(u64 device_addr, u64 size) {
+    if (!Enabled() || size == 0) {
+        return;
+    }
+    ++g_stream_write_generation;
+    for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
+        g_stream_write_pages[page & 0xffff] = g_stream_write_generation;
+    }
+}
+
+[[nodiscard]] inline u32 LastStreamWrite(u64 device_addr, u64 size) {
+    u32 latest{};
+    for (u64 page = device_addr >> 12; page <= (device_addr + size - 1) >> 12; ++page) {
+        latest = (std::max)(latest, g_stream_write_pages[page & 0xffff]);
+    }
+    return latest;
 }
 
 /// C (batching) measurement: whether the latest configured draw could merge with the one before.
@@ -336,7 +364,9 @@ inline void Report(const char* thread_name = "GPU thread") {
                           "inline_same",      "cb_same",           "cb_written",
                           "sync_uploads",     "sync_upload_bytes", "sync_skipped",
                           "shape_same",       "merge_candidate",   "merge_contiguous",
-                          "merged_draws",     "skipped_bindings"};
+                          "merged_draws",     "skipped_bindings",
+                          "uniform_new_address", "uniform_clean",  "uniform_stream_written",
+                          "uniform_unexplained"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

@@ -5,8 +5,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <chrono>
-#include <vector>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -14,6 +12,9 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <xmmintrin.h>
+#endif
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <limits>
@@ -356,30 +357,6 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     regs.reg_array[method] = argument;
     for (auto const& table : dirty.tables)
         dirty.flags[table[method]] = true;
-    // Diagnostics: EDEN_NX2_REG_HISTOGRAM=1 logs, every 20 s, the registers that marked state
-    // dirty most often (which registers change between draws).
-    static const bool histogram = std::getenv("EDEN_NX2_REG_HISTOGRAM") != nullptr;
-    if (histogram) [[unlikely]] {
-        static std::vector<u64> counts(Regs::NUM_REGS);
-        static auto window = std::chrono::steady_clock::now();
-        ++counts[method];
-        const auto now = std::chrono::steady_clock::now();
-        if (now - window > std::chrono::seconds{20}) {
-            window = now;
-            std::vector<u32> order(Regs::NUM_REGS);
-            for (u32 i = 0; i < order.size(); ++i) {
-                order[i] = i;
-            }
-            std::partial_sort(order.begin(), order.begin() + 48, order.end(),
-                              [](u32 a, u32 b) { return counts[a] > counts[b]; });
-            std::string line;
-            for (u32 i = 0; i < 48 && counts[order[i]] != 0; ++i) {
-                line += fmt::format(" {:#x}:{}", order[i], counts[order[i]] / 20);
-            }
-            LOG_INFO(HW_GPU, "Register dirty histogram (per s):{}", line);
-            std::ranges::fill(counts, 0);
-        }
-    }
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -560,6 +537,43 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
         if (w.amount != 0) {
             LOG_ERROR(HW_GPU, "  method {:#x} arg {:#x} amount {} pending {}", w.method, w.argument,
                       w.amount, w.pending);
+        }
+    }
+}
+
+void Maxwell3D::CallMethodRun(Core::System& system, const u64* words, size_t count) {
+    if (record_write_history || g_trace_first_method_writes) [[unlikely]] {
+        EngineInterface::CallMethodRun(system, words, count);
+        return;
+    }
+    namespace Profile = VideoCommon::Nx2Profile;
+    const bool profiling{Profile::Enabled()};
+    const bool skip_same{SkipSameValueWrites()};
+    for (size_t i = 0; i < count; ++i) {
+        // The front wrote these words on another core: each new cache line is a cross-core miss.
+        if ((i & 7) == 0) {
+#if defined(_MSC_VER) && defined(_M_X64)
+            _mm_prefetch(reinterpret_cast<const char*>(words + i + 32), _MM_HINT_T0);
+#elif defined(__GNUC__)
+            __builtin_prefetch(words + i + 32);
+#endif
+        }
+        const u32 method{static_cast<u32>((words[i] >> 8) & 0xffff)};
+        const u32 method_argument{static_cast<u32>(words[i] >> 32)};
+        // What CallMethod does for a plain state write. Anything else takes CallMethod.
+        if (method >= MacroRegistersStart || executing_macro != 0 || execution_mask[method] ||
+            method == MAXWELL3D_REG_INDEX(shadow_ram_control)) [[unlikely]] {
+            CallMethod(system, method, method_argument, true);
+            continue;
+        }
+        if (profiling) [[unlikely]] {
+            Profile::Add(Profile::Counter::MethodWrites, 1);
+            Profile::Add(Profile::Counter::SameValueWrites,
+                         regs.reg_array[method] == method_argument ? 1 : 0);
+        }
+        const u32 argument{ProcessShadowRam(method, method_argument)};
+        if (!skip_same || regs.reg_array[method] != argument) {
+            ProcessDirtyRegisters(method, argument);
         }
     }
 }

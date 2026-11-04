@@ -1077,16 +1077,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const auto rescaling_now{rescaling.Data()};
         const size_t payload_bytes{num_descriptor_entries * sizeof(DescriptorUpdateEntry)};
+        // The previous draw's entries are still in the descriptor queue: pending means nothing
+        // was recorded since, so the queue has not been reset either.
+        const DescriptorUpdateEntry* const previous_payload{std::exchange(recorded_payload, entries)};
         if (scheduler.HasPendingDraws() && !bind_pipeline && !bind_descriptor_buffer &&
             !update_rescaling && recorded_offset == descriptor_buffer_offset &&
             recorded_render_area_used == render_area.uses_render_area &&
             recorded_render_area == render_area.words && recorded_rescaling == rescaling_now &&
-            recorded_payload.size() == num_descriptor_entries &&
-            std::memcmp(recorded_payload.data(), entries, payload_bytes) == 0) {
+            previous_payload != nullptr &&
+            std::memcmp(previous_payload, entries, payload_bytes) == 0) {
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SkippedBindings, 1);
             return true;
         }
-        recorded_payload.assign(entries, entries + num_descriptor_entries);
         recorded_rescaling = rescaling_now;
         recorded_render_area_used = render_area.uses_render_area;
         recorded_render_area = render_area.words;
