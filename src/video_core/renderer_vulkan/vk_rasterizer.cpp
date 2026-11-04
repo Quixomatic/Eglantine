@@ -1718,7 +1718,10 @@ void RasterizerVulkan::FlushWork() {
     }
     // Keep the host GPU working while native commands are still being recorded.
     static const u32 native_flush_draws = [] {
-        constexpr u32 fallback = 128;
+        // 512 (was 128): DK Bananza makes ~150k draws a second, and each submission cost ~55 us of
+        // the GPU back thread; 512 measured 22.0 fps / 1% low 19.9 vs 21.4 / 16.3 on its open
+        // map, the same as 1024.
+        constexpr u32 fallback = 512;
         const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
         if (value == nullptr || value[0] < '0' || value[0] > '9') {
             return fallback;

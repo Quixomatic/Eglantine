@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.15] - 2026-11-04
+
+The GPU back thread submits every 512 draws instead of every 128 on Switch 2 titles: Donkey Kong
+Bananza's open map 21.4 -> 22.0 fps, 1% low 16.3 -> 19.9.
+
+### Changed
+- **`EDEN_NX2_FLUSH_DRAWS` defaults to 512** (was 128). At ~150k draws a second each submission
+  cost ~55 us of the back thread (`flush work` 65 ms/s); 512 and 1024 measured the same. The
+  variable still overrides it.
+
+### Internal
+- Measured and dropped: forcing small uniform buffers onto the cached path (bound in place,
+  uploaded when written): 15.5 fps, because DK writes that memory constantly.
+
 ## [0.1.14] - 2026-11-04
 
 Macro register writes reach the GPU back thread in batches: Donkey Kong Bananza's open map ~19 ->
