@@ -144,7 +144,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "split verify", "compute front init", "puller", "ring full", "writer wait", "other"};
 
 /// Number of Counter values (the enum is below; checked there).
-inline constexpr size_t CounterCount = 19;
+inline constexpr size_t CounterCount = 21;
 
 struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drains{};
@@ -212,6 +212,8 @@ enum class Counter : u32 {
     SameBuffers,    ///< Draws whose constant buffer, vertex and index bindings match the previous draw
     UniformReused,  ///< Small uniform binds that rebound the slot's previous allocation (same bytes)
     UniformCopied,  ///< Small uniform binds that copied their bytes into a new allocation
+    BindCacheHits,  ///< Draws whose textures came from the binding cache
+    BindCacheVerified, ///< Cache hits also resolved the full way (EDEN_NX2_BINDCACHE_VERIFY)
     Count,
 };
 static_assert(static_cast<size_t>(Counter::Count) == CounterCount);
@@ -307,7 +309,7 @@ inline void Report(const char* thread_name = "GPU thread") {
                           "empty_draws",      "list_copied",       "list_synced",
                           "list_no_page",     "list_draw_written", "list_stale",
                           "same_textures",    "same_buffers",      "uniform_reused",
-                          "uniform_copied"};
+                          "uniform_copied",   "bindcache_hits",    "bindcache_verified"};
         const double per_s = 1e9 / static_cast<double>(window);
         Snapshot snap{.thread = thread_name, .when_ns = now, .window_ns = window};
         for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {

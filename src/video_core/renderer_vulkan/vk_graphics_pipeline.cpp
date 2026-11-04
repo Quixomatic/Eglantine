@@ -389,6 +389,88 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+
+    // Binding cache, texture side: reuse the last resolution's image views and samplers while the
+    // handle words and the TIC/TSC entries they select compare equal (read through kept host
+    // pointers). Off by default while its hit path is slower than expected (DK: 92% hits, no
+    // mismatches, but 6.1 fps): EDEN_NX2_BINDCACHE=1 turns it on, EDEN_NX2_BINDCACHE_VERIFY=1
+    // also resolves every hit the full way and logs differences.
+    static const bool bindcache_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BINDCACHE");
+        return value != nullptr && value[0] != '0';
+    }();
+    static const bool bindcache_verify = std::getenv("EDEN_NX2_BINDCACHE_VERIFY") != nullptr;
+    constexpr bool texture_cacheable_spec =
+        !Spec::has_images && !Spec::has_texture_buffers && !Spec::has_image_buffers;
+    if (texture_cache_eligible < 0) {
+        bool eligible = true;
+        for (const auto& info : stage_infos) {
+            for (const auto& desc : info.texture_descriptors) {
+                eligible &= desc.handle_program == ~0U && !desc.has_secondary;
+            }
+        }
+        texture_cache_eligible = eligible ? 1 : 0;
+    }
+    const bool texture_cache_on =
+        texture_cacheable_spec && texture_cache_eligible == 1 && bindcache_enabled;
+    const u64 gpu_map_serial = Tegra::g_gpu_map_serial.load(std::memory_order_acquire);
+    const u64 device_map_serial = Core::g_device_map_serial.load(std::memory_order_acquire);
+    const auto read_raw = [&](const u8* host, GPUVAddr address) {
+        u32 raw;
+        if (host != nullptr) {
+            std::memcpy(&raw, host, sizeof(raw));
+        } else {
+            raw = gpu_memory->Read<u32>(address);
+        }
+        return raw;
+    };
+    auto& tbc = texture_binding_cache;
+    bool texture_hit = false;
+    if (texture_cache_on && tbc.valid && tbc.gpu_map_serial == gpu_map_serial &&
+        tbc.device_map_serial == device_map_serial &&
+        tbc.texture_serial == texture_cache.binding_cache_serial &&
+        tbc.via_header_index == via_header_index) {
+        size_t slot = 0;
+        bool same = true;
+        const auto check_stage = [&](size_t stage) {
+            const auto& stage_cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+            for (const auto& desc : stage_infos[stage].texture_descriptors) {
+                for (u32 index = 0; same && index < desc.count; ++index, ++slot) {
+                    if (slot >= tbc.slots.size()) {
+                        same = false;
+                        break;
+                    }
+                    const TextureSlotCache& entry = tbc.slots[slot];
+                    const GPUVAddr address = stage_cbufs[desc.cbuf_index].address +
+                                             desc.cbuf_offset + (index << desc.size_shift);
+                    same = address == entry.handle_address &&
+                           read_raw(entry.handle_host, address) == entry.handle_raw &&
+                           (entry.tic_host == nullptr ||
+                            std::memcmp(entry.tic_host, entry.tic.data(), 32) == 0) &&
+                           (entry.tsc_host == nullptr ||
+                            std::memcmp(entry.tsc_host, entry.tsc.data(), 32) == 0);
+                }
+            }
+        };
+        if constexpr (Spec::enabled_stages[0]) check_stage(0);
+        if constexpr (Spec::enabled_stages[1]) check_stage(1);
+        if constexpr (Spec::enabled_stages[2]) check_stage(2);
+        if constexpr (Spec::enabled_stages[3]) check_stage(3);
+        if constexpr (Spec::enabled_stages[4]) check_stage(4);
+        texture_hit = same && slot == tbc.slots.size();
+    }
+    const bool verify_hit = texture_hit && bindcache_verify;
+    if (verify_hit) {
+        texture_hit = false;
+    }
+    const bool recording = texture_cache_on && !texture_hit;
+    std::vector<TextureSlotCache> recorded_slots;
+    const bool native_tiling = gpu_memory->UsesNativeTiling();
+    const u32 tic_limit = regs.tex_header.limit;
+    const u32 tsc_limit = via_header_index ? tic_limit : regs.tex_sampler.limit;
+    const auto entry_host = [&](GPUVAddr address) -> const u8* {
+        return gpu_memory->GetPointer(address);
+    };
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -456,13 +538,43 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 add_image(desc, false);
             }
         }
-        for (const auto& desc : info.texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index) {
-                const auto handle{read_handle(desc, index)};
-                views.push_back({handle.first});
+        if (!texture_hit) {
+            for (const auto& desc : info.texture_descriptors) {
+                for (u32 index = 0; index < desc.count; ++index) {
+                    std::pair<u32, u32> handle;
+                    if (recording) {
+                        // The values are copied before the full resolution reads them: a write
+                        // in between makes the next comparison fail, never a stale hit.
+                        TextureSlotCache entry{};
+                        entry.handle_address = cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                               (index << desc.size_shift);
+                        entry.handle_host = entry_host(entry.handle_address);
+                        entry.handle_raw = read_raw(entry.handle_host, entry.handle_address);
+                        handle = TexturePair(entry.handle_raw, via_header_index);
+                        const u32 tic = Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
+                                                                           native_tiling);
+                        if (tic <= tic_limit) {
+                            entry.tic_host = entry_host(regs.tex_header.Address() + u64{tic} * 32);
+                            if (entry.tic_host != nullptr) {
+                                std::memcpy(entry.tic.data(), entry.tic_host, 32);
+                            }
+                        }
+                        if (handle.second <= tsc_limit) {
+                            entry.tsc_host =
+                                entry_host(regs.tex_sampler.Address() + u64{handle.second} * 32);
+                            if (entry.tsc_host != nullptr) {
+                                std::memcpy(entry.tsc.data(), entry.tsc_host, 32);
+                            }
+                        }
+                        recorded_slots.push_back(entry);
+                    } else {
+                        handle = read_handle(desc, index);
+                    }
+                    views.push_back({handle.first});
 
-                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
-                samplers.push_back(sampler);
+                    VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+                    samplers.push_back(sampler);
+                }
             }
         }
         if constexpr (Spec::has_images) {
@@ -493,10 +605,43 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
-    {
+    if (texture_hit) {
+        views.assign(tbc.views.begin(), tbc.views.end());
+        samplers.assign(tbc.samplers.begin(), tbc.samplers.end());
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        texture_cache.PrepareImageViews(std::span(views.data(), views.size()));
+        Profile::Add(Profile::Counter::BindCacheHits, 1);
+    } else {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+        if (verify_hit) {
+            bool equal = views.size() == tbc.views.size() && samplers.size() == tbc.samplers.size();
+            for (size_t i = 0; equal && i < views.size(); ++i) {
+                equal = views[i].id == tbc.views[i].id;
+            }
+            for (size_t i = 0; equal && i < samplers.size(); ++i) {
+                equal = samplers[i] == tbc.samplers[i];
+            }
+            if (!equal) {
+                static std::atomic<u32> reported{};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Binding cache mismatch: textures of pipeline {:#x} differ", key.Hash());
+                }
+            }
+            Profile::Add(Profile::Counter::BindCacheVerified, 1);
+        }
+        if (recording) {
+            tbc.valid = true;
+            tbc.via_header_index = via_header_index;
+            tbc.gpu_map_serial = gpu_map_serial;
+            tbc.device_map_serial = device_map_serial;
+            tbc.texture_serial = texture_cache.binding_cache_serial;
+            tbc.slots = std::move(recorded_slots);
+            tbc.views.assign(views.begin(), views.end());
+            tbc.samplers.assign(samplers.begin(), samplers.end());
+        }
     }
     // Profiling: how often a draw's bindings repeat the previous draw's (for a fast path).
     if (Profile::Enabled()) [[unlikely]] {

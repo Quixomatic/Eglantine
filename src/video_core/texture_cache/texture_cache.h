@@ -627,6 +627,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++binding_cache_serial;
         }
     } else {
         const bool linked_tsc = maxwell3d->regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
@@ -639,6 +640,7 @@ void TextureCache<P>::SynchronizeDescriptors(bool compute) {
             bindings_changed = true;
         if (bindings_changed) {
             ++texture_bindings_serial;
+            ++binding_cache_serial;
         }
     }
 }
@@ -2221,6 +2223,7 @@ void TextureCache<P>::InvalidateScale(Image& image) {
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
     }
+    ++binding_cache_serial;
     has_deleted_images = true;
 }
 
@@ -3565,6 +3568,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         channel_info.graphics_image_table.Invalidate();
         channel_info.compute_image_table.Invalidate();
     }
+    ++binding_cache_serial;
     has_deleted_images = true;
 }
 

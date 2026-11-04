@@ -206,6 +206,34 @@ private:
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+
+    /// Binding cache, texture side: the last full resolution's image views and samplers and the
+    /// values they came from (each handle word and its 32-byte TIC and TSC entries), with host
+    /// pointers to them. Reused while the values compare equal: DK rewrites these every frame with
+    /// the same contents, so they are compared, not write-tracked; the pointers skip the address
+    /// translation a full resolution does for every read.
+    struct TextureSlotCache {
+        GPUVAddr handle_address;
+        const u8* handle_host;
+        u32 handle_raw;
+        const u8* tic_host;
+        const u8* tsc_host;
+        std::array<u8, 32> tic;
+        std::array<u8, 32> tsc;
+    };
+    struct TextureBindingCache {
+        bool valid{};
+        bool via_header_index{};
+        u64 gpu_map_serial{};
+        u64 device_map_serial{};
+        u64 texture_serial{};
+        std::vector<TextureSlotCache> slots;
+        std::vector<VideoCommon::ImageViewInOut> views;
+        std::vector<VideoCommon::SamplerId> samplers;
+    };
+    TextureBindingCache texture_binding_cache;
+    /// -1 not computed, 0 no, 1 yes: only plain sampled textures with constant buffer handles.
+    s8 texture_cache_eligible{-1};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};

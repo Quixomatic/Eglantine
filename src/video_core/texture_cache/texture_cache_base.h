@@ -246,6 +246,18 @@ public:
     /// Get the sampler id from the graphics/compute descriptor table in the specified index
     SamplerId GetSamplerId(u32 index, bool compute);
 
+    /// The binding cache's reuse path: what VisitImageView does for a view it already resolved
+    /// (refresh the image's contents when written), for each view.
+    void PrepareImageViews(std::span<const ImageViewInOut> views) {
+        for (const ImageViewInOut& view : views) {
+            PrepareImageView(view.id, false, false);
+        }
+    }
+
+    /// Changes whenever resolved image views or samplers may no longer hold: descriptor tables
+    /// re-bound or invalidated (image deletion). The binding cache keys on it.
+    u64 binding_cache_serial = 1;
+
     /// Return a constant reference to the given sampler id
     [[nodiscard]] const Sampler& GetSampler(SamplerId id) const noexcept;
 

@@ -7,6 +7,30 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.16] - 2026-11-04
+
+A value-based binding cache for textures in `GraphicsPipeline::Configure`, off by default while its
+hit path is investigated.
+
+### Added
+- **Texture binding cache** (`EDEN_NX2_BINDCACHE=1`, off by default): a pipeline remembers its last
+  image views and samplers with the values they came from (each handle word and its 32-byte TIC and
+  TSC entries, with host pointers to them) and reuses them while those compare equal, skipping the
+  address translations and lookups of a full resolution. `EDEN_NX2_BINDCACHE_VERIFY=1` resolves
+  every hit the full way too and logs differences. In DK: 92% hits and no mismatches in verify
+  mode, but with the cache on alone the open map fell to 6.1 fps (`configure` 713 ms/s), a cost in
+  the hit path that is not understood yet.
+- Map serials: `Tegra::g_gpu_map_serial` (GPU virtual memory map/unmap) and
+  `Core::g_device_map_serial` (device memory map/unmap) invalidate kept host pointers;
+  `TextureCache::binding_cache_serial` changes on descriptor table rebinds and image deletion.
+- Profiler counters `bindcache_hits` / `bindcache_verified`.
+
+### Internal
+- Tried and reverted: a write-generation design (pages armed with write protection, generations
+  bumped by every write source). DK rewrites its handle constant buffers and descriptor pools every
+  frame with the same values, so armed pages were disarmed constantly (8 fps from protection churn;
+  18% hits once volatile pages were skipped). Values, not writes, are what repeat.
+
 ## [0.1.15] - 2026-11-04
 
 The GPU back thread submits every 512 draws instead of every 128 on Switch 2 titles: Donkey Kong

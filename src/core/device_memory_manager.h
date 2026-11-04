@@ -25,6 +25,10 @@ namespace Core {
 
 constexpr size_t DEVICE_PAGEBITS = 12ULL;
 constexpr size_t DEVICE_PAGESIZE = 1ULL << DEVICE_PAGEBITS;
+
+/// Bumped whenever device memory is mapped or unmapped: host pointers into device memory that a
+/// cache kept (the GPU binding cache) may have changed.
+inline std::atomic<u64> g_device_map_serial{1};
 constexpr size_t DEVICE_PAGEMASK = DEVICE_PAGESIZE - 1ULL;
 
 class DeviceMemory;
