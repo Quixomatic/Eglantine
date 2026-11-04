@@ -7,6 +7,14 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.3] - 2026-11-03
+
+The main window's title shows the build again instead of PokeDinner's fixed string.
+
+### Changed
+- **Window title**: back to upstream's `Eglantine | <version> | <compiler>` (which identifies the exact
+  commit and branch), with `| Quixomatic fork` added at the end.
+
 ## [0.1.2] - 2026-11-03
 
 Brings in the PokeDinner fork (Franseven/PokeDinner-a-Eglantine-Fork `master` 216b5034c6, 171 commits).
