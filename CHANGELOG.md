@@ -7,6 +7,17 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.11] - 2026-11-04
+
+### Changed
+- Small uniform buffers are compared and copied straight from guest memory when the range is
+  contiguous in host memory, instead of being staged in a scratch buffer first (one pass less per
+  bound uniform buffer per draw; no measurable fps change in DK, 19.5 fps on the open map).
+
+### Internal
+- Re-measured v0.1.10: the 1% low facing away is 53.8 fps, so the lower value seen once after the
+  worker wake batching was noise.
+
 ## [0.1.10] - 2026-11-04
 
 Two per-draw costs off the GPU back thread: open map 18.7 -> 19.1 fps.
