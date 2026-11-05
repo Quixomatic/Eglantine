@@ -7,6 +7,33 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.35] - 2026-11-05
+
+More of Lichii's Ocarina of Time fixes, hand ported. Tested in the game: it looks better and a session
+log shows no rejected shaders, but falling leaves still flash white. Our bloom port was also compared
+with Lichii's final PR #87 and needs no change.
+
+### Fixed
+- **White flashes from occlusion counts** (`Scheduler::EndPendingOperations`, Lichii PR #121, still open
+  there). Each submission reset the counter, so a report after one could read too low. It now pauses it.
+- **ISBEWR read a uniform mirror instead of its data register** when that register is high, which gave
+  Link's house door a NaN that bloom turned into a white glow (Lichii #100).
+- **F2I with a constant buffer source dropped its `|x|` and `-x`** (Lichii `1ad14bebb`).
+
+### Added
+- **More gathers** (Lichii #112): depth compare (`TLD4.DC`), and per-tap offsets found across unrelated
+  instructions and outgoing branches, then written to scratch registers as literals. If the offsets can't
+  be proven they stay in Rb, where Lichii rejects the program.
+- `LEA.HI` with a negated register, and `SURED` on buffers with every U32 operation (Lichii #112).
+- **Multiplies by 0 and 1 fold**, and so does the halves recombine an XMAD by 1 leaves, so OOT's sky
+  ambient pass finds its storage buffer (Lichii `3248b7cb1`, not merged there yet).
+
+### Changed
+- **Shader cache version 23**: every game rebuilds its shader cache once.
+
+### Internal
+- Tests from Lichii's encodings. All 205 cases pass. Donkey Kong Bananza was not measured.
+
 ## [0.1.34] - 2026-11-05
 
 Ocarina of Time reaches gameplay with its scene and minimap showing, instead of a black screen with

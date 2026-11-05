@@ -271,5 +271,96 @@ TEST_CASE("Ampere lowers the instructions Ocarina of Time rejected", "[video_cor
     lowers({{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}});
     // UIADD3 with a carry out to UP2.
     lowers({{0x0f067290, 0x00000006, 0x0ff5e03f, 0x000fe200}});
+    // TLD4.DC: the shadow pass's depth compare gather.
+    lowers({{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}});
+    // LEA.HI R1, R1, -R0, RZ, 0x1e.
+    lowers({{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}});
+}
+
+TEST_CASE("Ampere depth gathers keep coordinates, reference and result pairs", "[video_core][ampere]") {
+    const Instruction gather{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+    const std::array<Instruction, 2> code{{gather, EXIT}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.required_texture_buffer == 2);
+    const u64 pred = u64{7} << 16;
+    const auto copy = [pred](u64 target, u64 source) {
+        return 0x5c98000000000000ULL | pred | target | (u64{15} << 39) | (source << 20);
+    };
+    const std::array<u64, 8> expected{
+        copy(250, 24), copy(251, 25), copy(246, 28),
+        0xc800000000000000ULL | pred | 250 | (u64{250} << 8) | (u64{246} << 20) | (u64{2} << 28) |
+            (u64{15} << 31) | (u64{14} << 36) | (u64{1} << 50) | (u64{7} << 51),
+        copy(12, 250), copy(13, 251), copy(14, 252), copy(15, 253),
+    };
+    REQUIRE(lowered.instructions.size() == expected.size() + 1);
+    CHECK(std::equal(expected.begin(), expected.end(), lowered.instructions.begin()));
+}
+
+TEST_CASE("Ampere per-tap gathers materialize proven literal offsets", "[video_core][ampere]") {
+    // Offsets in R0 and R1, an unrelated LEA.HI between them and the F16 gather (the 1080p upscaler).
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    std::array<Instruction, 5> code{{
+        {{0x00007802, 0xff00ff00, 0xf00, 0}},
+        {{0x00017802, 0x01000001, 0xf00, 0}},
+        lea, gather, EXIT,
+    }};
+    const auto move_immediate = [](u64 target, u64 value) {
+        return 0x010000000007f000ULL | target | (value << 20);
+    };
+    const auto proven = LowerToMaxwell(code);
+    INFO(proven.error);
+    REQUIRE(static_cast<bool>(proven));
+    const auto start = proven.source_instruction_offsets[3];
+    CHECK(proven.instructions[start] == move_immediate(248, 0xff00ff00));
+    CHECK(proven.instructions[start + 1] == move_immediate(249, 0x01000001));
+
+    // The LEA.HI overwrites R1 after its literal: the offsets aren't constant and stay in Rb.
+    code[2].words[0] = 0x08017211;
+    const auto unproven = LowerToMaxwell(code);
+    INFO(unproven.error);
+    REQUIRE(static_cast<bool>(unproven));
+    const auto first = unproven.source_instruction_offsets[3];
+    const auto gather_word = std::find_if(
+        unproven.instructions.begin() + first, unproven.instructions.end(),
+        [](u64 word) { return (word >> 56) == 0xc8; });
+    REQUIRE(gather_word != unproven.instructions.end());
+    CHECK(((*gather_word >> 20) & 0xff) == 0);
+    CHECK(((*gather_word >> 54) & 3) == 2);
+}
+
+TEST_CASE("Ampere LEA.HI negates a register base", "[video_core][ampere]") {
+    const Instruction capture{{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}};
+    const std::array<Instruction, 2> code{{capture, EXIT}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered.instructions.size() == 3);
+    CHECK(lowered.instructions[0] == 0x38280000002701faULL);
+    CHECK(lowered.instructions[1] == 0x5c1100000007fa01ULL);
+}
+
+TEST_CASE("Ampere surface reductions keep every U32 operation", "[video_core][ampere]") {
+    for (u32 op = 0; op < 8; ++op) {
+        for (const u32 dimension : {1U, 3U}) {
+            const Instruction instruction{{0x0400759fU, 0x00008400U | (dimension << 29),
+                                           0x0010e000U | (op << 23), 0}};
+            const std::array<Instruction, 2> code{{instruction, EXIT}};
+            const auto lowered = LowerToMaxwell(code);
+            INFO(lowered.error);
+            REQUIRE(static_cast<bool>(lowered));
+            CHECK(lowered.instructions[0] == (0xeb48000000000400ULL | (u64{7} << 16) | (u64{op} << 24) |
+                                              (u64{dimension} << 33) | (u64{0x84} << 36)));
+        }
+    }
+}
+
+TEST_CASE("Ampere ISBEWR shadows a high data register", "[video_core][ampere]") {
+    // A mesh stage storing an attribute from R240 must not read the uniform mirror at R240.
+    const Instruction store{{0x00007927, 0x0000f000 >> 8, 0, 0}};
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(store, 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.Bits(32, 8) < 216);
 }
 } // namespace
