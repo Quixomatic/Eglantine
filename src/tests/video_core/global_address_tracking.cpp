@@ -12,48 +12,25 @@
 #include "shader_recompiler/ir_opt/passes.h"
 
 namespace {
-/// A non-native program with no state; the pass only asks whether it is native.
-class NullEnvironment final : public Shader::Environment {
+class StubEnvironment final : public Shader::Environment {
 public:
-    u64 ReadInstruction(u32) override {
-        return 0;
-    }
-    u32 ReadCbufValue(u32, u32) override {
-        return 0;
-    }
-    Shader::TextureType ReadTextureType(u32) override {
-        return {};
-    }
-    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
-        return {};
-    }
-    bool IsTexturePixelFormatInteger(u32) override {
-        return false;
-    }
-    u32 ReadViewportTransformState() override {
-        return 0;
-    }
-    u32 TextureBoundBuffer() const override {
-        return 0;
-    }
-    u32 LocalMemorySize() const override {
-        return 0;
-    }
-    u32 SharedMemorySize() const override {
-        return 0;
-    }
-    std::array<u32, 3> WorkgroupSize() const override {
-        return {};
-    }
-    bool HasHLEMacroState() const override {
-        return false;
-    }
+    u64 ReadInstruction(u32) override { return 0; }
+    u32 ReadCbufValue(u32, u32) override { return 0; }
+    Shader::TextureType ReadTextureType(u32) override { return {}; }
+    Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override { return {}; }
+    bool IsTexturePixelFormatInteger(u32) override { return false; }
+    u32 ReadViewportTransformState() override { return 0; }
+    u32 TextureBoundBuffer() const override { return 0; }
+    u32 LocalMemorySize() const override { return 0; }
+    u32 SharedMemorySize() const override { return 0; }
+    std::array<u32, 3> WorkgroupSize() const override { return {1, 1, 1}; }
+    bool HasHLEMacroState() const override { return false; }
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
         return std::nullopt;
     }
     void Dump(u64, u64) override {}
 };
-} // Anonymous namespace
+} // namespace
 
 TEST_CASE("Global address tracking stops at a memory load", "[shader_recompiler][global_memory]") {
     using namespace Shader;
@@ -72,7 +49,7 @@ TEST_CASE("Global address tracking stops at a memory load", "[shader_recompiler]
     program.post_order_blocks.push_back(&block);
     HostTranslateInfo host{};
     host.min_ssbo_alignment = 16;
-    NullEnvironment env;
+    StubEnvironment env;
     Optimization::GlobalMemoryToStorageBufferPass(env, program, host);
 
     const auto has = [&](IR::Opcode opcode) {

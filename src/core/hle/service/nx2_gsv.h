@@ -1731,6 +1731,9 @@ private:
         // previous frame's fence instead and let the game prepare frame N+1 meanwhile (waiting
         // for this frame there cost 8-56 ms of every 34-105 ms frame, or never finished).
         // EDEN_NX2_FRAMES_AHEAD=1 always waits for the previous frame, =0 always for this one.
+        // Upstream makes Donkey Kong Bananza always wait for this frame (freezes, rubberbanding);
+        // that took its open map from 25.2 to 19.0 fps and the view away from 60 to 37, so it stays
+        // automatic here. EDEN_NX2_FRAMES_AHEAD=0 gives upstream's behaviour.
         static const int frames_ahead = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
             return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
@@ -1801,6 +1804,11 @@ private:
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));
+            // Counted at the reply: the game gets its buffers back with this frame unfinished.
+            if (const u32 fence_id = ~w[22]; fence_id < 192 &&
+                !system.Host1x().GetSyncpointManager().IsReadyGuest(fence_id, w[24])) {
+                ++m_stats.ran_ahead;
+            }
             if (m_stats.last_present != std::chrono::steady_clock::time_point{}) {
                 const long long frame = to_us(entered - m_stats.last_present);
                 m_stats.frame_us += frame;
@@ -1817,10 +1825,11 @@ private:
                 LOG_INFO(Service,
                          "nx2:vi2 last 600 presents: frame {} us (max {}, {} over 100 ms), "
                          "blocked on the GPU fence {} us (max {}), composite {} us, vblank "
-                         "pacing {} us; {} of them 2+ vblanks, game speed {:.0f}%",
+                         "pacing {} us, {} ran a frame ahead; {} of them 2+ vblanks, game speed "
+                         "{:.0f}%",
                          m_stats.frame_us / 599, m_stats.max_frame_us, m_stats.hitches,
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
-                         m_stats.pace_us / 600, m_stats.double_frames,
+                         m_stats.pace_us / 600, m_stats.ran_ahead, m_stats.double_frames,
                          seconds > 0 ? 100.0 * m_stats.vblanks / (seconds * 60.0) : 0.0);
                 m_stats = {.last_present = entered};
             }
@@ -1839,7 +1848,7 @@ private:
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
         long long max_frame_us{}, hitches{};
-        u32 presents{};
+        u32 presents{}, ran_ahead{};
         u32 vblanks{};
         u32 double_frames{};
         std::chrono::steady_clock::time_point last_present{};
