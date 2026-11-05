@@ -225,12 +225,11 @@ const CPUCaps g_cpu_caps = [] {
         }
     }
 
-    // AMD CPUs have no leaf 0x15 (Zen 4 stops at 0x10): measure their invariant TSC too, or every
-    // guest clock read (CNTPCT, which games read thousands of times a frame) goes through the
-    // host's much slower QueryPerformanceCounter. Intel CPUs that have the leaf but report no
-    // crystal frequency (e.g. Coffee Lake) keep the OS clock: an i5-9400F crashed at launch on the
-    // measured RDTSC clock.
-    if (max_std_fn < 0x15 && caps.invariant_tsc && caps.tsc_frequency == 0) {
+    // Measure any invariant TSC without a reported frequency (Lichii #161): AMD CPUs have no leaf
+    // 0x15, and Skylake/Coffee Lake report no crystal frequency, so every guest clock read went
+    // through the host's much slower QueryPerformanceCounter. (An i5-9400F was once reported to
+    // crash at launch on the measured clock; Lichii #161 measured on an i7-9700.)
+    if (caps.invariant_tsc && caps.tsc_frequency == 0) {
         caps.tsc_frequency = X64::EstimateRDTSCFrequency();
     }
 
@@ -257,6 +256,7 @@ WallClock::WallClock(bool invariant_, u64 rdtsc_frequency_) noexcept
     , rdtsc_ns_factor{invariant_ ? GetFixedPoint64Factor(rdtsc_frequency_ % NsRatio::den, NsRatio::den) : 0}
     , cntpct_rdtsc_factor{invariant_ ? GetFixedPoint64Factor(CNTFRQ, rdtsc_frequency_) : 0}
     , gputick_rdtsc_factor{invariant_ ? GetFixedPoint64Factor(GPUTickFreq, rdtsc_frequency_) : 0}
+    , base_rdtsc{invariant_ ? Common::X64::FencedRDTSC() : 0}
     , invariant{invariant_}
 {}
 
@@ -279,8 +279,27 @@ std::chrono::milliseconds WallClock::GetTimeMS() const {
 }
 
 s64 WallClock::GetCNTPCT() const {
-    if (!invariant)
+    if (!invariant) {
+#ifdef _WIN32
+        // Lichii #161: QPC directly, without the steady_clock conversion.
+        static const u64 qpf = [] {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            return static_cast<u64>(f.QuadPart);
+        }();
+        LARGE_INTEGER qpc{};
+        QueryPerformanceCounter(&qpc);
+        const u64 cntfrq = GetGuestCNTFRQ();
+        if (qpf == 10'000'000ULL && cntfrq == Switch2CNTFRQ) {
+            return static_cast<s64>((static_cast<u64>(qpc.QuadPart) * 25ULL) >> 3);
+        }
+        if (qpf != 0) {
+            return static_cast<s64>(
+                MultiplyAndDivide64(static_cast<u64>(qpc.QuadPart), cntfrq, qpf));
+        }
+#endif
         return MultiplyAndDivide64(GetUptime(), GetGuestCNTFRQ(), NsRatio::den);
+    }
     return MultiplyHigh(GetUptime(), cntpct_rdtsc_factor.load(std::memory_order_relaxed));
 }
 
@@ -299,9 +318,25 @@ s64 WallClock::GetGPUTick() const {
 }
 
 s64 WallClock::GetUptime() const {
-    if (!invariant)
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    return s64(Common::X64::FencedRDTSC());
+    if (!invariant) {
+#ifdef _WIN32
+        static const u64 qpf = [] {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            return static_cast<u64>(f.QuadPart);
+        }();
+        if (qpf == 10'000'000ULL) {
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            return qpc.QuadPart * 100LL;
+        }
+#endif
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    // Anchored at launch (Lichii #161), as the inline CNTPCT in dynarmic is.
+    return static_cast<s64>(Common::X64::FencedRDTSC() - base_rdtsc);
 }
 
 bool WallClock::IsNative() const {

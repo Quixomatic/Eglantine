@@ -1734,10 +1734,17 @@ private:
         // Upstream makes Donkey Kong Bananza always wait for this frame (freezes, rubberbanding);
         // that took its open map from 25.2 to 19.0 fps and the view away from 60 to 37, so it stays
         // automatic here. EDEN_NX2_FRAMES_AHEAD=0 gives upstream's behaviour.
-        static const int frames_ahead = [] {
+        static const int frames_ahead_setting = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
             return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
         }();
+        // Lichii #161: Ocarina of Time always runs a frame ahead (triple-buffered present), which
+        // took its present's fence wait from ~12.1 ms to ~3 us. EDEN_NX2_FRAMES_AHEAD overrides.
+        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        int frames_ahead = frames_ahead_setting;
+        if (frames_ahead == -1 && system.GetApplicationProcessProgramID() == OcarinaOfTimeProgramId) {
+            frames_ahead = 1;
+        }
         // The game's present interval (vblanks per frame) is the high half of word 12.
         const u32 present_interval = std::clamp<u32>((w[12] >> 16) & 0xff, 1, 4);
         if (present_interval != m_present_interval) {
@@ -1790,7 +1797,7 @@ private:
         }
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank(w[12]);
+        PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
@@ -1837,6 +1844,8 @@ private:
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+        // Channels suspended on semaphores this present's caller releases next (Lichii #161).
+        system.GPU().WakePendingChannels();
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -1869,7 +1878,7 @@ private:
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-    void PaceToVblank(u32 timing) {
+    void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
@@ -1877,10 +1886,10 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const auto& process = Kernel::GetCurrentProcess(kernel);
+        // The presenting thread's process, not the current one (upstream #547 via Lichii #110).
         const bool mkw_dynamic =
-            process.GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process.IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
+            process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
+            process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
         if (mkw_dynamic) {
             swap_interval = 1;
@@ -1923,6 +1932,47 @@ private:
         // command buffers ahead misses the equal-value gates its other channels acquire.
         const auto deadline = start + std::chrono::milliseconds{4000};
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            // Lichii #161: an event the GPU thread sets as it reaches the fence or goes idle on
+            // suspended channels (then this frame can't finish before the present returns).
+            // EDEN_NX2_PENDING_WAKE=0 waits on a condition variable as before.
+            static const bool pending_wake = [] {
+                const char* value = std::getenv("EDEN_NX2_PENDING_WAKE");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (pending_wake) {
+                if (unless_gpu_waits && system.GPU().IsIdleOnPendingSemaphore()) {
+                    return false;
+                }
+                struct EventWake {
+                    std::shared_ptr<Common::Event> event = std::make_shared<Common::Event>();
+                    std::atomic<bool> done{};
+                };
+                auto wake = std::make_shared<EventWake>();
+                if (unless_gpu_waits) {
+                    system.GPU().SetPendingIdleWake(wake->event);
+                }
+                syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
+                    wake->done.store(true, std::memory_order_release);
+                    wake->event->Set();
+                });
+                bool gpu_waited = false;
+                while (!wake->done.load(std::memory_order_acquire) && system.IsPoweredOn() &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    if (unless_gpu_waits) {
+                        if (system.GPU().IsIdleOnPendingSemaphore()) {
+                            return false;
+                        }
+                        gpu_waited |= system.GPU().HasSuspendedChannels();
+                        if (gpu_waited && std::chrono::steady_clock::now() - start >
+                                              std::chrono::milliseconds{3}) {
+                            return false;
+                        }
+                    }
+                    wake->event->WaitFor(unless_gpu_waits
+                                             ? std::chrono::nanoseconds{std::chrono::microseconds{250}}
+                                             : std::chrono::nanoseconds{std::chrono::milliseconds{50}});
+                }
+            } else {
             // Woken by the GPU thread as it reaches the fence. Polling with 200 us sleeps slept
             // about 1 ms per check on Windows, added to every frame. An action left registered
             // after a timeout fires later on a state nobody waits on.
@@ -1953,6 +2003,7 @@ private:
                     }
                 }
                 wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+            }
             }
         }
         if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {

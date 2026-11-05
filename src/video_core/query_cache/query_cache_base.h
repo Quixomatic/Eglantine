@@ -64,6 +64,21 @@ public:
                            [this](QueryLocation location) { InvalidateQuery(location); });
     }
 
+    /// EDEN_NX2_INLINE_INVALIDATE: changes whenever a query is cached.
+    [[nodiscard]] u64 PageSerial() const noexcept {
+        return page_serial.load(std::memory_order_acquire);
+    }
+
+    /// The page serial when no cached query is in [addr, addr + size), else 0.
+    [[nodiscard]] u64 CleanSerial(VAddr addr, std::size_t size) {
+        bool touched = false;
+        IterateCache<false>(addr, size, [&touched](QueryLocation) {
+            touched = true;
+            return true;
+        });
+        return touched ? 0 : page_serial.load(std::memory_order_relaxed);
+    }
+
     void FlushRegion(VAddr addr, std::size_t size) {
         bool result = false;
         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
@@ -183,6 +198,7 @@ protected:
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
     std::mutex cache_mutex;
+    std::atomic<u64> page_serial{1};
 
     /// Device pages that have ever held a cached query, hashed into a bit filter that never
     /// clears: ranges with none of their bits set skip cache_mutex (inline writes check every

@@ -104,6 +104,7 @@ add_library(video_core STATIC
     gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
+    gpu_timestamp.h
     guest_memory.h
     invalidation_accumulator.h
     memory_manager.cpp
@@ -111,7 +112,12 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_clean_pages.h
+    nx2_draw_runs.h
+    nx2_fast_draw.h
     nx2_profile.h
+    host_gpu_profile.h
+    pending_maps.h
     present.h
     pte_kind.h
     query_cache/bank_base.h
@@ -204,6 +210,10 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/vk_resolved_batch.cpp
+    renderer_vulkan/vk_resolved_batch.h
+    renderer_vulkan/vk_parallel_recorder.cpp
+    renderer_vulkan/vk_parallel_recorder.h
     renderer_vulkan/vk_shader_reuse.cpp
     renderer_vulkan/vk_shader_reuse.h
     renderer_vulkan/vk_shader_util.cpp

@@ -36,6 +36,8 @@ class CommandPool;
 class Device;
 class Framebuffer;
 class GraphicsPipeline;
+class ParallelRecorder;
+class PassRecorder;
 class StateTracker;
 
 struct QueryCacheParams;
@@ -73,6 +75,11 @@ public:
     /// safe to touch worker resources.
     void WaitWorker();
 
+    /// EDEN_NX2_PARALLEL_RECORD=1: render passes are captured as immutable batches.
+    bool UsesResolvedBatches() const {
+        return resolved_recorder != nullptr;
+    }
+
     /// Sends currently recorded work to the worker thread.
     /// Sends the current chunk to the worker. A waiting worker is woken once a few chunks are
     /// queued, or at once with force_wake (submissions and waits for the worker need it).
@@ -94,13 +101,51 @@ public:
     /// of a renderpass.
     void RequestOutsideRenderPassOperationContext();
 
+    /// A fragment barrier ends the render pass only if the next draw needs it (Lichii #161):
+    /// the pass wrote storage, or the draw samples one of its render targets.
+    void DeferFragmentBarrier() {
+        fragment_barrier_pending = state.renderpass != VK_NULL_HANDLE;
+    }
+
+    bool TakeFragmentBarrier() {
+        return std::exchange(fragment_barrier_pending, false);
+    }
+
+    void NoteRenderPassStores() {
+        render_pass_has_stores = true;
+    }
+
+    bool RenderPassHasStores() const {
+        return render_pass_has_stores;
+    }
+
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
     }
 
+    /// Changes whenever a render pass begins or ends (EDEN_NX2_FAST_DRAW).
+    u64 RenderPassSerial() const {
+        return render_pass_serial;
+    }
+
+    /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
+    const GraphicsPipeline* BoundGraphicsPipeline() const {
+        return state.graphics_pipeline;
+    }
+
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+
+    /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
+    /// recorded after it must be dropped instead of reaching the driver without a pipeline
+    /// (Lichii #142).
+    void SetGraphicsPipelineMissing(bool missing) {
+        graphics_pipeline_missing = missing;
+    }
+    [[nodiscard]] bool GraphicsPipelineMissing() const {
+        return graphics_pipeline_missing;
+    }
 
     /// Update the rescaling state. Returns true if the state has to be updated.
     bool UpdateRescaling(bool is_rescaling);
@@ -125,6 +170,8 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
     void RecordWithUploadBuffer(T&& command) {
+        const VideoCommon::HostGpuProfile::Scope profile{
+            VideoCommon::HostGpuProfile::Phase::Enqueue};
         if (VideoCommon::GpuSplit::check_owner) [[unlikely]] {
             VideoCommon::GpuSplit::CheckOwner("Scheduler::Record");
         }
@@ -183,6 +230,11 @@ public:
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore->CurrentTick();
+    }
+
+    /// Changes whenever bound command buffer state may be lost (new context, render pass end).
+    [[nodiscard]] u64 RecordingEpoch() const noexcept {
+        return recording_epoch;
     }
 
     /// Returns true when a tick has been triggered by the GPU.
@@ -385,6 +437,10 @@ private:
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     std::unique_ptr<CommandPool> command_pool;
+    std::unique_ptr<ParallelRecorder> parallel_recorder;
+    std::unique_ptr<PassRecorder> resolved_recorder;
+    u64 worker_submission_tick{1};
+    u64 last_worker_submitted_tick{};
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
@@ -397,6 +453,11 @@ private:
     std::function<void()> on_submit;
 
     State state;
+    bool fragment_barrier_pending{};
+    bool render_pass_has_stores{};
+    u64 recording_epoch = 0;
+    u64 render_pass_serial{};
+    bool graphics_pipeline_missing{};
 
     u32 num_renderpass_images = 0;
     std::array<VkImage, 9> renderpass_images{};

@@ -292,6 +292,9 @@ struct UserConfig {
     /// This tells the translator a wall clock will be used, thus allowing it
     /// to avoid writting certain unnecessary code only needed for cycle timers.
     bool wall_clock_cntpct = false;
+    /// Inline CNTPCT: high 64 bits of (rdtsc - base) * factor, when the factor is nonzero.
+    std::uint64_t inline_cntpct_tsc_base = 0;
+    std::uint64_t inline_cntpct_tsc_factor = 0;
 
     /// This allows accurately emulating protection fault handlers. If true, we check
     /// for exit after every data memory access by the emulated program.

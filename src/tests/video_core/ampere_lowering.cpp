@@ -147,4 +147,297 @@ TEST_CASE("Ampere programs go on past an EXIT that a branch jumps over", "[video
     REQUIRE(static_cast<bool>(lowered));
     REQUIRE(lowered.source_size == sizeof(code));
 }
+
+TEST_CASE("Ampere capture ends at the return of a helper called past the EXIT",
+          "[video_core][ampere]") {
+    // Ocarina 69a40579971fb867: MOV R0, 0x20; CALL.REL.NOINC; EXIT; RET.REL.NODEC R0, then the
+    // next program in memory.
+    const std::array<Instruction, 4> code{{
+        {{0x00007802, 0x20, 0x00000f00, 0}},
+        {{0x00007944, 0x10, 0x03c00000, 0}},
+        EXIT,
+        {{0x00007950, 0xffffffc0, 0x03c3ffff, 0}},
+    }};
+    ProgramCaptureState capture;
+    for (u32 index = 0; index + 1 < code.size(); ++index)
+        CHECK(capture.Observe(code[index], index) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(code.back(), 3) == ProgramCaptureState::Result::Complete);
+    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
+
+    ProgramCaptureState jump;
+    CHECK(jump.Observe({{0x00007944, 0x10, 0x03c00000, 0}}, 0) ==
+          ProgramCaptureState::Result::Continue);
+    CHECK(jump.Observe(EXIT, 1) == ProgramCaptureState::Result::Continue);
+    CHECK(jump.Observe(EXIT, 2) == ProgramCaptureState::Result::Complete);
+}
+
+TEST_CASE("Ampere uniform select and bit operations reach every uniform register",
+          "[video_core][ampere]") {
+    // Ocarina e8decc3e5c0c184e: @UP0 USEL UR4, UR4, 0x20, UP1. UP0 and UP1 come from R239 into
+    // P6 and P5; the SEL runs under P6 and the guest predicates are restored.
+    const std::array<Instruction, 2> select{{
+        {{0x04040887, 0x20, 0x08800000, 0x000fe200}},
+        EXIT,
+    }};
+    const auto selected = LowerToMaxwell(select);
+    INFO(selected.error);
+    REQUIRE(static_cast<bool>(selected));
+    const std::array<u64, 5> expected_select{
+        0x010000000207f0fcULL, 0x38e800000607fffdULL, 0x38f000000607ef00ULL,
+        0x5ca002800fc6dcdcULL, 0x38f000000607fd00ULL};
+    CHECK(std::search(selected.instructions.begin(), selected.instructions.end(),
+                      expected_select.begin(), expected_select.end()) !=
+          selected.instructions.end());
+
+    // Ocarina 2079791ecb288b83: UBREV UR4, UR17.
+    const std::array<Instruction, 2> reverse{{
+        {{0x000472be, 0x11, 0x08000000, 0x000fc800}},
+        EXIT,
+    }};
+    const auto reversed = LowerToMaxwell(reverse);
+    INFO(reversed.error);
+    REQUIRE(static_cast<bool>(reversed));
+    CHECK(reversed.instructions.front() == 0x382801800007e9dcULL);
+
+    // Ocarina 2079791ecb288b83: UFLO.U32.SH UR21, UR21.
+    const std::array<Instruction, 2> leading{{
+        {{0x001572bd, 0x15, 0x080e0400, 0x000fe400}},
+        EXIT,
+    }};
+    const auto found = LowerToMaxwell(leading);
+    INFO(found.error);
+    REQUIRE(static_cast<bool>(found));
+    CHECK(found.instructions.front() == 0x5c3002000ed700edULL);
+
+    // Ocarina 2079791ecb288b83: UPOPC UR10, UR17.
+    const std::array<Instruction, 2> count{{
+        {{0x000a72bf, 0x11, 0x08000000, 0x000fe200}},
+        EXIT,
+    }};
+    const auto counted = LowerToMaxwell(count);
+    INFO(counted.error);
+    REQUIRE(static_cast<bool>(counted));
+    CHECK(counted.instructions.front() == 0x5c0800000e9700e2ULL);
+}
+
+TEST_CASE("Ampere guarded uniform comparisons keep the output when the guard is false",
+          "[video_core][ampere]") {
+    // Ocarina 2079791ecb288b83: @UP4 UISETP.GT.U32.AND UP0, UPT, UR21, 0x1f, UPT. UP4 and the old
+    // UP0 load into P2 and P6, so a false guard merges UP0 back unchanged.
+    const std::array<Instruction, 2> code{{
+        {{0x1500488c, 0x1f, 0x0bf04070, 0x000fe200}},
+        EXIT,
+    }};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    const std::array<u64, 6> expected{
+        0x0100000001f7f0fcULL, 0x38e800000447fffdULL, 0x38f000000447ef00ULL,
+        0x5b6803800fc2ed37ULL, 0x38e800000407efefULL, 0x38f000000447fd00ULL};
+    CHECK(std::equal(expected.begin(), expected.end(), lowered.instructions.begin()));
+
+    // SEL R3, R4, UR7, P0
+    const std::array<Instruction, 2> select{{
+        {{0x04037c07, 0x7, 0x08000000, 0x000fe400}},
+        EXIT,
+    }};
+    const auto selected = LowerToMaxwell(select);
+    INFO(selected.error);
+    REQUIRE(static_cast<bool>(selected));
+    CHECK(selected.instructions.front() == 0x5ca000000df70403ULL);
+}
+
+TEST_CASE("Ampere lowers the instructions Ocarina of Time rejected", "[video_core][ampere]") {
+    const auto lowers = [](const Instruction& instruction) {
+        const std::array<Instruction, 2> code{{instruction, EXIT}};
+        const auto lowered = LowerToMaxwell(code);
+        INFO(lowered.error);
+        CHECK(static_cast<bool>(lowered));
+    };
+    // ULOP with an immediate, in four compute programs.
+    lowers({{0x040e74a4, 0x00003c00, 0x0f8e020e, 0x000fc400}});
+    lowers({{0x040474a4, 0x00003c00, 0x0f8e0208, 0x000fe200}});
+    // RED.E.ADD F32 at a uniform address.
+    lowers({{0xff00798e, 0x00000009, 0x0c10e704, 0x0021e800}});
+    // SHF.R.U64 funnel, immediate.
+    lowers({{0x0e0e7819, 0x00000015, 0x00001211, 0x020fe200}});
+    // USHF.L.U32.HI with an immediate.
+    lowers({{0x3f0d7499, 0xffffffff, 0x0801060f, 0x000fe400}});
+    lowers({{0x3f057499, 0x00000001, 0x08010e04, 0x000fe400}});
+    // TLD4 on a 2D array.
+    lowers({{0x1e347b63, 0xb0801021, 0x001e0f32, 0x00014200}});
+    lowers({{0x120a7b63, 0xb080100c, 0x001e0f06, 0x100f4a00}});
+    // TLD4.PTP.F16: the upscaler's last pass, which writes the 2560x1440 image.
+    lowers({{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}});
+    // UIADD3 with a carry out to UP2.
+    lowers({{0x0f067290, 0x00000006, 0x0ff5e03f, 0x000fe200}});
+    // TLD4.DC: the shadow pass's depth compare gather.
+    lowers({{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}});
+    // LEA.HI R1, R1, -R0, RZ, 0x1e.
+    lowers({{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}});
+}
+
+TEST_CASE("Ampere depth gathers keep coordinates, reference and result pairs", "[video_core][ampere]") {
+    const Instruction gather{{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}};
+    const std::array<Instruction, 2> code{{gather, EXIT}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.required_texture_buffer == 2);
+    const u64 pred = u64{7} << 16;
+    const auto copy = [pred](u64 target, u64 source) {
+        return 0x5c98000000000000ULL | pred | target | (u64{15} << 39) | (source << 20);
+    };
+    const std::array<u64, 8> expected{
+        copy(250, 24), copy(251, 25), copy(246, 28),
+        0xc800000000000000ULL | pred | 250 | (u64{250} << 8) | (u64{246} << 20) | (u64{2} << 28) |
+            (u64{15} << 31) | (u64{14} << 36) | (u64{1} << 50) | (u64{7} << 51),
+        copy(12, 250), copy(13, 251), copy(14, 252), copy(15, 253),
+    };
+    REQUIRE(lowered.instructions.size() == expected.size() + 1);
+    CHECK(std::equal(expected.begin(), expected.end(), lowered.instructions.begin()));
+}
+
+TEST_CASE("Ampere per-tap gathers materialize proven literal offsets", "[video_core][ampere]") {
+    // Offsets in R0 and R1, an unrelated LEA.HI between them and the F16 gather (the 1080p upscaler).
+    const Instruction lea{{0x08087211, 0x00000007, 0x078ff8ff, 0x000fc800}};
+    const Instruction gather{{0x0a0c7b63, 0x30003000, 0x001eaf0d, 0x000fc200}};
+    std::array<Instruction, 5> code{{
+        {{0x00007802, 0xff00ff00, 0xf00, 0}},
+        {{0x00017802, 0x01000001, 0xf00, 0}},
+        lea, gather, EXIT,
+    }};
+    const auto move_immediate = [](u64 target, u64 value) {
+        return 0x010000000007f000ULL | target | (value << 20);
+    };
+    const auto proven = LowerToMaxwell(code);
+    INFO(proven.error);
+    REQUIRE(static_cast<bool>(proven));
+    const auto start = proven.source_instruction_offsets[3];
+    CHECK(proven.instructions[start] == move_immediate(248, 0xff00ff00));
+    CHECK(proven.instructions[start + 1] == move_immediate(249, 0x01000001));
+
+    // The LEA.HI overwrites R1 after its literal: the offsets aren't constant and stay in Rb.
+    code[2].words[0] = 0x08017211;
+    const auto unproven = LowerToMaxwell(code);
+    INFO(unproven.error);
+    REQUIRE(static_cast<bool>(unproven));
+    const auto first = unproven.source_instruction_offsets[3];
+    const auto gather_word = std::find_if(
+        unproven.instructions.begin() + first, unproven.instructions.end(),
+        [](u64 word) { return (word >> 56) == 0xc8; });
+    REQUIRE(gather_word != unproven.instructions.end());
+    CHECK(((*gather_word >> 20) & 0xff) == 0);
+    CHECK(((*gather_word >> 54) & 3) == 2);
+}
+
+TEST_CASE("Ampere LEA.HI negates a register base", "[video_core][ampere]") {
+    const Instruction capture{{0x01017211, 0x80000000, 0x078ff0ff, 0x000fca00}};
+    const std::array<Instruction, 2> code{{capture, EXIT}};
+    const auto lowered = LowerToMaxwell(code);
+    INFO(lowered.error);
+    REQUIRE(lowered.instructions.size() == 3);
+    CHECK(lowered.instructions[0] == 0x38280000002701faULL);
+    CHECK(lowered.instructions[1] == 0x5c1100000007fa01ULL);
+}
+
+TEST_CASE("Ampere surface reductions keep every U32 operation", "[video_core][ampere]") {
+    for (u32 op = 0; op < 8; ++op) {
+        for (const u32 dimension : {1U, 3U}) {
+            const Instruction instruction{{0x0400759fU, 0x00008400U | (dimension << 29),
+                                           0x0010e000U | (op << 23), 0}};
+            const std::array<Instruction, 2> code{{instruction, EXIT}};
+            const auto lowered = LowerToMaxwell(code);
+            INFO(lowered.error);
+            REQUIRE(static_cast<bool>(lowered));
+            CHECK(lowered.instructions[0] == (0xeb48000000000400ULL | (u64{7} << 16) | (u64{op} << 24) |
+                                              (u64{dimension} << 33) | (u64{0x84} << 36)));
+        }
+    }
+}
+
+TEST_CASE("Ampere ISBEWR shadows a high data register", "[video_core][ampere]") {
+    // A mesh stage storing an attribute from R240 must not read the uniform mirror at R240.
+    const Instruction store{{0x00007927, 0x0000f000 >> 8, 0, 0}};
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(store, 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.Bits(32, 8) < 216);
+}
+
+// Lichii #144's encodings (from its ampere_fast_fusion_logged tests).
+TEST_CASE("Ocarina indexed uniform constant loads keep their U8 and U16 widths",
+          "[video_core][ampere][oot]") {
+    struct Case {
+        Instruction instruction;
+        u64 target, index, offset, bank, width;
+    };
+    // ULDC UR, c[bank][UR + offset] from Ocarina of Time's compute programs.
+    const std::array cases{
+        Case{{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 220, 233, 0x00, 5, 2},
+        Case{{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 223, 222, 0x82, 4, 0},
+        Case{{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 220, 229, 0x03, 5, 0},
+        Case{{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 224, 222, 0x82, 4, 0},
+    };
+    for (const Case& test : cases) {
+        CAPTURE(test.instruction.words[0]);
+        const auto lowered = LowerToMaxwell(std::array{test.instruction, EXIT});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+              (0xef90000000070000ULL | test.target | (test.index << 8) | (test.offset << 20) |
+               (test.bank << 36) | (test.width << 48)));
+    }
+    // An indexed load can have any immediate: the register can align it (ULDC.32 at UR15 + 0x29).
+    const Instruction indexed_word{{0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600}};
+    const auto word = LowerToMaxwell(std::array{indexed_word, EXIT});
+    INFO(word.error);
+    REQUIRE(word);
+    CHECK(word.instructions[word.source_instruction_offsets[0]] ==
+          (0xef90000000070000ULL | 223 | (u64{231} << 8) | (u64{0x29} << 20) | (u64{4} << 36) |
+           (u64{4} << 48)));
+    // A direct U16 load needs an even offset, and a direct subword load the short offset range.
+    const Instruction misaligned{{0x00077ab9, 0x01000040, 0x00000400, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{misaligned, EXIT}));
+    const Instruction far{{0x00077ab9, 0x01200000, 0x00000000, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{far, EXIT}));
+}
+
+TEST_CASE("Ocarina I2F from a uniform register selects any byte", "[video_core][ampere][oot]") {
+    // I2F.F32.U8 R9, UR17.B3
+    const Instruction convert{{0x00097d06, 0x30000011, 0x08001000, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{convert, EXIT});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+          (0x5cb8000000070000ULL | 9 | (u64{2} << 8) | (u64{233} << 20) | (u64{3} << 41)));
+}
+
+TEST_CASE("Ocarina F2IP with two sources and default rounding lowers", "[video_core][ampere][oot]") {
+    // F2IP.U8.F32 R41, R40, R39, RZ
+    const Instruction convert{{0x28297243, 0x27, 0x000004ff, 0x000fc400}};
+    const auto lowered = LowerToMaxwell(std::array{convert, EXIT});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    auto modified = convert;
+    modified.words[2] = 0x000044ff;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, EXIT}));
+    modified = convert;
+    modified.words[2] = 0x00000406;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, EXIT}));
+}
+
+TEST_CASE("Ocarina uniform adds and LEAs carry through any UP", "[video_core][ampere][oot]") {
+    // UIADD3 UR12, UR12, 0x10 and ULEA UR10, UR6, UR10, 2 with the carry out in UPn.
+    constexpr Instruction add{{0x0c0c7890, 0x00000010, 0x0ff9e03f, 0x000fc400}};
+    constexpr Instruction lea{{0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200}};
+    for (u32 up = 0; up < 7; ++up) {
+        CAPTURE(up);
+        for (Instruction instruction : {add, lea}) {
+            instruction.words[2] = (instruction.words[2] & ~(7U << 17)) | (up << 17);
+            const auto lowered = LowerToMaxwell(std::array{instruction, EXIT});
+            INFO(lowered.error);
+            CHECK(lowered);
+        }
+    }
+}
 } // namespace

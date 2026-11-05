@@ -39,6 +39,10 @@ u32 TranslationReads::Ask(Shader::Environment& env, Query query, u32 arg0, u32 a
     }
     case Query::HasHLEMacroState:
         return env.HasHLEMacroState() ? 1 : 0;
+    case Query::StorageBufferPointer:
+        return env.IsCbufStorageBufferPointer(arg0, arg1) ? 1 : 0;
+    case Query::IndirectStorageBufferPointer:
+        return env.IsCbufIndirectStorageBufferPointer(arg0 & 0xff, arg0 >> 8, arg1) ? 1 : 0;
     }
     UNREACHABLE_MSG("Unknown environment query {}", static_cast<u32>(query));
 }
@@ -51,6 +55,8 @@ TranslationReads::Properties TranslationReads::PropertiesOf(const Shader::Enviro
         result.gp_passthrough_mask = env.GpPassthroughMask();
     }
     result.workgroup_size = env.WorkgroupSize();
+    result.mesh_registers = env.MeshRegisters();
+    result.is_native_program = env.IsNativeProgram();
     result.stage = env.ShaderStage();
     result.start_address = env.StartAddress();
     result.texture_bound_buffer = env.TextureBoundBuffer();
@@ -91,10 +97,25 @@ RecordingEnvironment::RecordingEnvironment(Shader::Environment& inner_) : inner{
     // Shader::Environment's own accessors read these members.
     sph = inner->SPH();
     gp_passthrough_mask = inner->GpPassthroughMask();
+    mesh_registers = inner->MeshRegisters();
+    mesh_primitive_header = inner->MeshPrimitiveHeader();
     stage = inner->ShaderStage();
     start_address = inner->StartAddress();
     is_proprietary_driver = inner->IsProprietaryDriver();
     reads.RecordProperties(*inner);
+}
+
+bool RecordingEnvironment::IsNativeProgram() const {
+    return inner->IsNativeProgram();
+}
+
+bool RecordingEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    return AskAndRecord(TranslationReads::Query::StorageBufferPointer, index, offset) != 0;
+}
+
+bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    return AskAndRecord(TranslationReads::Query::IndirectStorageBufferPointer,
+                        index | (offset << 8), indirect) != 0;
 }
 
 // Instructions and program addresses are not recorded: they are the program's code, which its

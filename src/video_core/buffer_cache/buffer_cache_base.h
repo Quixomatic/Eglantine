@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/nx2.h"
@@ -246,6 +247,9 @@ public:
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
+    /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
+    void ClearDownload(DAddr base_addr, u64 size);
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
     void DownloadMemory(DAddr device_addr, u64 size);
@@ -290,7 +294,7 @@ public:
     void UnbindGraphicsStorageBuffers(size_t stage);
 
     bool BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                   bool is_written);
+                                   bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindGraphicsTextureBuffers(size_t stage);
 
@@ -300,7 +304,7 @@ public:
     void UnbindComputeStorageBuffers();
 
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
-                                  bool is_written);
+                                  bool is_written, u32 indirect_offset = ~0U);
 
     void UnbindComputeTextureBuffers();
 
@@ -354,6 +358,10 @@ public:
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
+    /// The split drained (Lichii perf/dkb-front-waits): downloads `pages` and every page draws
+    /// wrote since it was last flushed with one GPU wait, and notes the latter synced. Each page's
+    /// next lists then read guest memory instead of draining and flushing one page at a time.
+    void Nx2FlushListPages(std::span<const DAddr> pages);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
     /// no longer holds the page.
     void Nx2NoteListHostWrite(DAddr device_addr, u64 size);
@@ -379,6 +387,18 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
+
+    /// EDEN_NX2_FAST_DRAW: updates and binds only the index buffer for a reused indexed draw.
+    /// False when that created or deleted buffers, so the draw needs a full resolve.
+    [[nodiscard]] bool RebindIndexBuffer();
+    /// Updates and binds the vertex buffers whose registers changed; false when that created or
+    /// deleted buffers.
+    [[nodiscard]] bool RebindVertexBuffers();
+    /// Resolves the graphics uniform, storage and texture buffers bound since the last draw;
+    /// false when that created or deleted buffers.
+    [[nodiscard]] bool UpdateGraphicsStageBuffers();
+    /// EDEN_NX2_FAST_DRAW_VERIFY: a hash of the bindings a reused or delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
     template <typename Func>
     void BufferOperations(Func&& func) {
@@ -524,10 +544,13 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
-    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
-                                               bool is_written, bool native_pointer = false) const;
+    [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
+                                               bool native_pointer = false,
+                                               bool table_pointer = false) const;
 
     [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                PixelFormat format);
@@ -551,8 +574,6 @@ private:
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
 
-    void ClearDownload(DAddr base_addr, u64 size);
-
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
@@ -574,6 +595,27 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// EDEN_NX2_BUFFER_SKIP: the inputs and result of each vertex stream's last lookup.
+    struct VertexLookup {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        const void* owner{};
+        u64 map_serial{};
+        u64 deletions{};
+        Binding binding{};
+        bool valid{};
+    };
+    std::array<VertexLookup, NUM_VERTEX_BUFFERS> vertex_lookups{};
+    u64 buffer_deletions = 0;
+    struct SkipStats {
+        u64 window_start{};
+        u64 lookups{};
+        u64 lookups_kept{};
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+    } skip_stats;
 
     /// A range synchronized while its tracker region had `epoch`: while the region's epoch is
     /// unchanged no page of it became CPU-modified, so the range has nothing to upload.
@@ -636,22 +678,21 @@ private:
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
-    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// pages, which flushes them on demand (or marks them Preflushable with preflushing enabled).
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        u64 armed_bytes = 0;
-        read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
-            armed_bytes += upper - lower;
-        });
-        if (armed_bytes == end - begin) {
+        if (!read_trapped_ranges.Arm(begin, end - begin)) {
             return;
         }
-        read_trapped_ranges.Add(begin, end - begin);
         device_memory.ArmReadTraps(begin, end - begin);
     }
 
-    Common::RangeSet<DAddr> read_trapped_ranges;
+    ReadTrapTracker read_trapped_ranges;
+    /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
+    /// writes in all of them, so the reads that usually follow it find nothing left to flush.
+    Common::RangeSet<DAddr> cpu_readback_ranges;
+    bool download_cpu_readback_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
     /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
@@ -664,15 +705,40 @@ private:
     /// Queues a GPU write to [addr, addr + size): copied back at the next fence when downloads are
     /// on or the range was read by the guest CPU (Preflushable); else only the parts the CPU is known
     /// to read (cpu_read_ranges) are, and the rest traps the CPU's next read (ArmReadTraps).
+    /// With only Preflushable marks, just the marked pages are queued (Lichii #104): a write that
+    /// covers one marked page of a large buffer would otherwise copy the whole buffer back at every
+    /// fence. EDEN_NX2_EXACT_PREFLUSH=0 restores the old behaviour.
     void QueueDownload(DAddr addr, u64 size) {
-        if (DownloadsAtFence(addr, size)) {
+        static const bool exact = [] {
+            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(addr, size);
             return;
         }
-        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
-            uncommitted_gpu_modified_ranges.Add(start, end - start);
+        if (!exact && memory_tracker.IsRegionPreflushable(addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(addr, size);
+            return;
+        }
+        const DAddr end = addr + size;
+        u64 queued = 0;
+        if (exact) {
+            memory_tracker.ForEachPreflushableRange(addr, size, [&](DAddr begin, u64 length) {
+                const DAddr lower = (std::max)(begin, addr);
+                const DAddr upper = (std::min)(begin + length, end);
+                if (lower < upper) {
+                    uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+                    queued += upper - lower;
+                }
+            });
+        }
+        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr range_end) {
+            uncommitted_gpu_modified_ranges.Add(start, range_end - start);
         });
-        ArmReadTraps(addr, size);
+        if (queued < size) {
+            ArmReadTraps(addr, size);
+        }
     }
 
 

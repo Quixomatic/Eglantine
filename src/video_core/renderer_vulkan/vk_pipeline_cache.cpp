@@ -18,6 +18,7 @@
 #include <bit>
 #include <numeric>
 #include "common/cityhash.h"
+#include "common/cpu_features.h"
 #include "common/scope_exit.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -70,7 +71,7 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GraphicsEnvironment;
 
-constexpr u32 CACHE_VERSION = 21;
+constexpr u32 CACHE_VERSION = 24;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -384,8 +385,16 @@ bool IsShaderReuseAllowed() {
 }
 
 size_t GetTotalPipelineWorkers() {
-    const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+    const size_t logical_threads =
+        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
+    const size_t max_core_threads = logical_threads - 1ULL;
+    // Lichii #161: EDEN_NX2_PIPELINE_WORKERS=<n> sets the count.
+    if (const char* const env = std::getenv("EDEN_NX2_PIPELINE_WORKERS"); env && *env) {
+        const long parsed = std::strtol(env, nullptr, 10);
+        if (parsed > 0) {
+            return std::min<size_t>(static_cast<size_t>(parsed), max_core_threads);
+        }
+    }
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -395,6 +404,12 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    // Half the cores on small CPUs without SMT, which the guest CPU threads need (Lichii #161).
+    if (const auto physical_cores = Common::GetProcessorCount();
+        physical_cores && static_cast<size_t>(*physical_cores) >= logical_threads &&
+        logical_threads <= 8ULL) {
+        return std::max<size_t>(logical_threads / 2ULL, 2ULL);
+    }
     return max_core_threads;
 #endif
 }
@@ -727,7 +742,8 @@ constexpr u32 UsedPipelinesMagic = 0x31505545; // "EUP1"
 // MoltenVK keeps the previous eight sessions: a pipeline built while playing goes through
 // SPIR-V -> MSL -> Metal, far more than the 2-3 ms the shorter window assumes, so each one
 // built at boot is a stutter avoided.
-constexpr u8 UsedPipelinesMaxAge = 2;
+// Lichii #161: 16 sessions (was 2), so a pipeline built once is not built again mid-game.
+constexpr u8 UsedPipelinesMaxAge = 16;
 constexpr u8 UsedPipelinesMaxAgeMoltenVK = 8;
 
 u8 MaxUsedPipelineAge(const Device& device) {
@@ -1173,7 +1189,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
         return nullptr;
     }
     if (used_this_session.insert(pipeline.get()).second &&
-        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::minutes{2}) {
+        std::chrono::steady_clock::now() - used_pipelines_saved > std::chrono::seconds{15}) {
         SaveUsedPipelines();
     }
     if (current_pipeline) {
@@ -1204,7 +1220,7 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 9000;
+    constexpr u64 EvictAfterFrames = 36000; // Lichii #161 (was 9000)
     if (frame_count <= EvictAfterFrames) {
         return;
     }

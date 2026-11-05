@@ -336,6 +336,12 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
     };
 
     scheduler.Record([this, constants, current_frame, flow_w, flow_h](vk::CommandBuffer cmdbuf) {
+        // The last real frame becomes the history and this one the current copy, before the flow
+        // reads them (Lichii #149): copying the new frame into both after the flow made every
+        // generated frame the newest frame blended with itself.
+        CopyImageToImage(cmdbuf, *m_current_image, *m_history_image, m_extent);
+        CopyImageToImage(cmdbuf, current_frame, *m_current_image, m_extent);
+
         // Transition motion image to GENERAL for storage write
         TransitionImageLayout(cmdbuf, *m_motion_image, VK_IMAGE_LAYOUT_GENERAL);
 
@@ -347,9 +353,6 @@ void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage c
 
         // Motion vectors: GENERAL ΓåÆ SHADER_READ_ONLY
         BarrierComputeWriteToRead(cmdbuf, *m_motion_image);
-
-        // Batched dual-copy: source ΓåÆ history + current (3 barriers instead of 6)
-        CopyImageToTwo(cmdbuf, current_frame, *m_history_image, *m_current_image, m_extent);
     });
 
     m_flow_valid = true;

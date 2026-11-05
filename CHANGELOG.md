@@ -7,6 +7,271 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.40] - 2026-11-05
+
+The rest of Lichii's performance work: its front-wait and back-record branches, more fixes on by
+default, and its fast draw and parallel recording experiments behind switches (off, as in Lichii).
+Ocarina of Time's forest sample reads 37.3 fps (1% low 31.6) against 36.7 (32.2) on 0.1.39, within
+noise; no rejected shaders, 0 flash frames of 140. Donkey Kong Bananza was not measured.
+
+### Changed
+- **Draw-written command list pages flush in one GPU round trip** (Lichii `407136901`,
+  `EDEN_NX2_CMDPAGE_BATCH=0`), and macro DMA reads of GPU-written pages wait only for the methods that
+  write memory (`7429fba04`, `EDEN_NX2_MACRO_DMA_DRAIN=1` drains fully again).
+- **Draw setup** (Lichii `perf/dkb-back-record`): `GetMemoryLayoutSize` reuses the last interval it
+  found, binding clean buffers skips words with nothing to do (`EDEN_NX2_EMPTY_WORD_SKIP=0`),
+  descriptor tables no longer shrink, and gathered buffers retire with their owners.
+- **Idle cores spin 100 us before blocking** on Switch 2 titles (Lichii #150; `EDEN_NX2_IDLE_SPIN_US`).
+- **Boost and Overclock scale Switch 2 GPU time** since the last present (Lichii #114,
+  `EDEN_NX2_AMPERE_GPU_CLOCK=0`).
+- The alpha test reference is rounded to 1/255 in pipeline keys (upstream #544 via Lichii #110,
+  `EDEN_NX2_ALPHA_REF_ROUND=0`); untouched buffers skip usage tracker resets.
+
+### Added
+- **Fast draw, off by default** (Lichii `perf/nx2-fast-draw`): `EDEN_NX2_FAST_DRAW=1` reuses unchanged
+  draws, `=2` adds delta draws; `EDEN_NX2_FAST_DRAW_VERIFY`, `EDEN_NX2_BUFFER_SKIP`,
+  `EDEN_NX2_INLINE_INVALIDATE`, `EDEN_NX2_DYNAMIC_SKIP`, `EDEN_NX2_DRAW_RUNS`. Reused draws still go
+  through our draw merging and the failed-pipeline check.
+- **Parallel recording, off by default** (Lichii `perf/gpu-parallel-record`):
+  `EDEN_NX2_PARALLEL_RECORD=1` records resolved graphics batches on secondary workers. Its
+  `EDEN_NX2_METHOD_FAST` part is not ported yet.
+- **OOT upscaler stand-in for Mesa's Intel driver** (Lichii #143), where tensor programs are no longer
+  emulated outside DLSS evaluations; NVIDIA is unchanged.
+
+### Fixed
+- Command list entries on memory a queued GPU map changes wait for the map (upstream #543, Pokopia);
+  `PaceToVblank` checks the presenting process (upstream #547, MKW); an out-of-date swapchain acquire
+  returns at once (#427).
+- The small-page `PageTableOp` updates the kind map under its lock.
+- RomFS falls back to the loaded one for program index 0 (Lichii #159); a failed ZBIC segment fails the
+  NSO load (#160).
+
+### Internal
+- Tests from Lichii's branches (range map, memory tracker, descriptor table, pending maps, GPU
+  timestamps, parallel recording); 268 pass, 1 needs `EDEN_TEST_VULKAN=1`.
+- Not taken: Lichii's run cache, written-SSBO mark cap and split rebalance (marked "not for nx2"
+  there), debug-only traces.
+
+## [0.1.39] - 2026-11-05
+
+Lichii's performance work, hand ported on top of our own GPU optimizations: Ocarina of Time's forest
+sample reads 36.7 fps (1% low 32.2) against 23.1 (20.7) on 0.1.38, with no rejected shaders and no
+white flashes (0 of 140 captured frames). Default settings; Donkey Kong Bananza was not measured.
+Every behaviour change has an `EDEN_NX2_*` off switch.
+
+### Changed
+- **Fewer submissions and render passes** (Lichii #161). Fragment barriers end the render pass only
+  when the next draw samples a render target or the pass wrote storage
+  (`EDEN_NX2_DEFER_FRAGMENT_BARRIER=0`). Switch 2 titles submit every 4096 draws outside MoltenVK
+  (`EDEN_NX2_FLUSH_DRAWS` still overrides), deferred flushes wait up to 5 ms, and command list copies
+  submit at once.
+- **The GPU split's front sleeps instead of spinning** while it waits for the back
+  (`EDEN_NX2_SPLIT_FRONT_SLEEP=0`); the back spins 512 times before idling (`EDEN_NX2_SPLIT_BACK_SPIN`).
+- **Semaphore acquires that are already met don't drain the back** (`EDEN_NX2_ACQUIRE_FAST=0`).
+  Command list and macro DMA reads wait only for the writers before the last host sync
+  (`EDEN_NX2_SYNCED_WRITERS=0`, `EDEN_NX2_DMA_READ_WAIT=0`), and only executable compute and DMA methods
+  count as writers (`EDEN_NX2_EXEC_WRITERS=0`).
+- **Constant buffer data writes are batched on the front** (`EDEN_NX2_CB_BATCH=0`), and executable 3D
+  methods rewritten with the same value no longer set dirty flags (`EDEN_NX2_SKIP_SAME_EXEC=0`).
+- **The GPU thread wakes as soon as a suspended channel can run**, polls 2 ms before sleeping, and
+  `WaitForFrame` stops waiting once it is idle on pending channels (`EDEN_NX2_PENDING_WAKE=0`). OOT
+  presents one frame ahead (`EDEN_NX2_FRAMES_AHEAD` overrides). Syncpoint increments skip the lock when
+  nothing waits.
+- **Guest CPU timing** (Lichii #161): invariant TSCs without a reported frequency are measured, the
+  wall clock is anchored at launch, `CNTPCT_EL0` is read inline (`EDEN_NX2_INLINE_CNTPCT=0`; native
+  clock, CPU clock Normal, sync core speed off), ordered loads are plain moves and `DMB` LD/ST is
+  skipped on x64, HostTiming runs at Critical priority. Unsafe CPU accuracy uses host FMA.
+- **Buffers without CPU writes skip the upload scan**, and an unchanged index buffer is not bound
+  again (`EDEN_NX2_INDEX_BIND_SKIP=0`) (Lichii #161).
+- **CPU writes onto GPU-written pages are uploaded into the buffer** instead of downloading the page
+  first (Lichii #103, `EDEN_NX2_INLINE_PAGE_WRITES=0/1`).
+- **A new render target a clear overwrites whole is not uploaded first** (Lichii #141).
+- **Empty direct draws are skipped** (Lichii `1aae8cdf1a`, `EDEN_NX2_SKIP_EMPTY_DRAWS=0`).
+- Video: the AV1 decoder `av1` (dav1d) is preferred, frames are reused, and a hardware decoder that
+  fails to open falls back to 4 CPU threads (Lichii #161).
+- Pipelines: used pipelines are kept for 16 sessions and saved every 15 s; `EDEN_NX2_PIPELINE_WORKERS`
+  sets the build worker count (Lichii #161).
+
+### Fixed
+- **Split deadlock**: a fence wait submits deferred work first (Lichii #149, OOT entering gameplay).
+- RED and SURED data registers are shadowed (Lichii #149); FSR3 frame generation interpolates
+  between the previous and current frame (Lichii #149).
+- **The remaining OOT compute forms** (Lichii #144, #125): indexed `ULDC` of 8 and 16 bits with any
+  offset (our 4 rejected programs), any UPn carry for `ULEA` and `UIADD3`, `F2IP.U8.F32`, P2R in the
+  call proof. 32-bit global `ATOM.CAS` (Lichii #140).
+- Draws after a graphics pipeline that failed to build are dropped (Lichii #142), the AMD demote
+  reorder counts nested returns (#127), the dirty memory gather is serialized (#138), ReinterpretImage
+  copies one depth aspect (#89), swapchain recreation waits for the device (#88).
+- `Common::Event::WaitFor` waits until its deadline after early MWAITX and UMWAIT wakes (Lichii #120,
+  #137) and wakes on `Set` on CPUs with neither (#161).
+- XCI Switch 2 titles get the Switch 2 clock (Lichii #119). NUP program ids are known before the GPU
+  and the JIT are created, and per-game values survive a config reload (#161).
+
+### Not taken
+- #161's forced OOT settings (accuracy, vsync, reactive flushing, DLSS, CPU clock): set per game by
+  the user.
+
+### Internal
+- Tests: Lichii's Event tests and new lowering tests for the #144 forms; all 226 cases pass.
+
+## [0.1.38] - 2026-11-05
+
+Ocarina of Time's foliage no longer flashes white while the camera moves, at Low GPU accuracy with the
+GPU thread split on, and the forest renders faster. Confirmed by the user in play. One sample in the
+forest read 23.1 fps (1% low 20.7) and 63,000 draws a second, against 20.6 (17.5) and 31,000 before,
+at a similar but not identical spot.
+
+### Fixed
+- **Guest CPU reads of GPU results were stale** (Lichii #147, still open there; its commit 23d33887a8).
+  Read pages of Switch 2 titles were marked preflushable after their first read, then only refreshed
+  at fences, so the game could read older GPU output: in OOT, occlusion results that hid the foliage
+  for a frame. These titles now keep read traps and flush on demand. A read that must flush downloads
+  every range the CPU has read back after GPU writes in one batch, with one GPU wait. Consumed traps
+  re-arm on the next GPU write. `EDEN_NX2_PREFLUSH=1` restores preflushing, `=0` forces flushing on
+  demand.
+- `DownloadMemory` clips each buffer's download to the requested range.
+
+### Changed
+- **GPU writes copy back only their preflushable pages at fences** (Lichii #104), instead of the whole
+  write. Our copy-back of CPU-read pages (Pokopia's sky) is kept. `EDEN_NX2_EXACT_PREFLUSH=0` turns it
+  off.
+- **`MaxContinuousRange` answers are cached per thread until the GPU page table changes** (Lichii #146).
+  Native storage buffer binds walked up to 8 MiB of pages each: `read handles` on the GPU back thread
+  299 -> 88 ms/s in that sample.
+- **The running occlusion query is capped at one bank across submissions** (Lichii #121's second
+  commit). OOT's title screen and file select count without resetting or reporting, so the query had
+  grown to 16,384 slots by the start of gameplay.
+
+### Internal
+- `ReadTrapTracker` (`buffer_cache/read_trap_tracker.h`) and Lichii's 4 readback tests. All 211 test
+  cases pass. Donkey Kong Bananza was not measured.
+- Known: 4 compute programs are still rejected on `ULDC` indexed byte and 16-bit loads.
+- The flash investigation found that GPU accuracy High or `gpu_fence_behavior=Balanced` also hid it,
+  which pointed at results reaching the game late. Its temporary diagnostics are not committed.
+
+## [0.1.37] - 2026-11-05
+
+Ocarina of Time's grass and foliage render, and its 3D stays at full resolution. Foliage still flashes
+white while the player moves and for about 15-20 seconds after stopping. A sample with these changes
+reads about 21 fps (1% low about 17) where v0.1.36 read about 39 at another spot, so the two are not
+directly comparable. Donkey Kong Bananza was not measured.
+
+### Added
+- **Storage buffers behind dynamic and loaded pointers** (Lichii `d854ff0de`, `f9acc60a5`, on its test
+  branches). Native programs bind every mapped slot of a pointer array read at a computed offset, and a
+  buffer whose pointer is loaded from a table in memory
+  (`StorageBufferDescriptor::indirect_offset`). The address walk follows `ShuffleIndex`, phis and selects
+  of table pointers, and table entries of compute programs use only free bindings. Table entries
+  are classified by `IsCbufIndirectStorageBufferPointer`, which `RecordingEnvironment` forwards and records.
+- **Pointer table pools bind to the end of their mapping, up to 64 MiB, when read-only** (Lichii
+  `4dcbd1cb9`), so grass instance records past 8 MiB read correctly.
+- **Built-in "Max Resolution" patch for OOT** (Lichii #124, still open there). It takes the game's own
+  branch for dynamic resolution disabled, checked against title, module, build id and the original
+  word, and a user mod at that word wins. It's listed in Add-Ons, where it can be turned off.
+
+### Changed
+- **OOT's graphics storage buffers are sized from their mappings** (from Lichii `37569c01d`, which does
+  this for every native game). `EDEN_NX2_OOT_MAPPED_SSBO=0` turns it off with the compute sizing.
+- **Shader cache version 24**: every game rebuilds its shader cache once.
+
+### Internal
+- `.plans/dk-perf-scripts/flash_oot.sh` counts one-capture white flashes from a screenshot burst.
+- Known: `read handles` takes about 300 ms/s of the GPU back thread in OOT's forest, and 4 compute
+  programs are rejected on `ULDC` indexed byte and 16-bit loads. All 207 tests pass. Lichii's tests for
+  the built-in patch and pointer forms are not ported.
+
+## [0.1.36] - 2026-11-05
+
+Switch 2 query report timestamps are in nanoseconds, the unit of the other clocks these games read
+(Lichii #84, which took Star Fox from about 31 to 60 fps). Ocarina of Time's open area is unchanged on
+average: 39.3 fps against 39.6 with it off, 1% low 28.1 against 30.7 (one run each).
+
+### Fixed
+- **`GPU::GetTicks` returned scaled GPU ticks to Switch 2 titles** (`gpu_timestamp.h`). Switch 1 titles
+  keep their ticks and the Boost and Overclock scaling. On Switch 2 titles, Boost and Overclock no longer
+  make GPU durations look shorter. `EDEN_NX2_NS_TIMESTAMPS=0` returns to the ticks.
+
+### Internal
+- `.plans/dk-perf-scripts/measure_oot.sh`: boots OOT, runs its `to_gameplay` route and takes a 20 s
+  sample with a GPU profile and a screenshot.
+- Tests from Lichii's `gpu_timestamp` cases (207 pass, run before the switch was added).
+
+## [0.1.35] - 2026-11-05
+
+More of Lichii's Ocarina of Time fixes, hand ported. Tested in the game: it looks better and a session
+log shows no rejected shaders, but falling leaves still flash white. Our bloom port was also compared
+with Lichii's final PR #87 and needs no change.
+
+### Fixed
+- **White flashes from occlusion counts** (`Scheduler::EndPendingOperations`, Lichii PR #121, still open
+  there). Each submission reset the counter, so a report after one could read too low. It now pauses it.
+- **ISBEWR read a uniform mirror instead of its data register** when that register is high, which gave
+  Link's house door a NaN that bloom turned into a white glow (Lichii #100).
+- **F2I with a constant buffer source dropped its `|x|` and `-x`** (Lichii `1ad14bebb`).
+
+### Added
+- **More gathers** (Lichii #112): depth compare (`TLD4.DC`), and per-tap offsets found across unrelated
+  instructions and outgoing branches, then written to scratch registers as literals. If the offsets can't
+  be proven they stay in Rb, where Lichii rejects the program.
+- `LEA.HI` with a negated register, and `SURED` on buffers with every U32 operation (Lichii #112).
+- **Multiplies by 0 and 1 fold**, and so does the halves recombine an XMAD by 1 leaves, so OOT's sky
+  ambient pass finds its storage buffer (Lichii `3248b7cb1`, not merged there yet).
+
+### Changed
+- **Shader cache version 23**: every game rebuilds its shader cache once.
+
+### Internal
+- Tests from Lichii's encodings. All 205 cases pass. Donkey Kong Bananza was not measured.
+
+## [0.1.34] - 2026-11-05
+
+Ocarina of Time reaches gameplay with its scene and minimap showing, instead of a black screen with
+only the HUD, and no longer crashes after its first cutscene. Its bloom and fog are still wrong. The
+bloom work is from Lichii's PR #87 as it stood before it was finished, and newer Lichii fixes are
+still to come. Donkey Kong Bananza was not measured on this version.
+
+### Fixed
+- **Shader reuse hid native programs from translation** (`vk_shader_reuse`). `RecordingEnvironment`
+  did not forward `IsNativeProgram()` or `IsCbufStorageBufferPointer()` and did not copy the mesh
+  registers, so with reuse on, native programs were translated as non-native with zeroed mesh
+  registers: register shadow copies were dropped, storage buffers failed to track, and every mesh
+  pipeline failed with `Mesh output topology 0`. This affected other native games too.
+- **Crash from preparing the null image view** (`PrepareImageView`, present since 0.1.16). The binding
+  cache's hit path prepared null views, which ran on null image slot 0: a 0-byte staging request or
+  `Touch(-1)`. It can crash any game and is in the 0.1.32 and 0.1.33 releases.
+- **The black screen.** `TLD4.PTP.F16` was rejected because its rewrite moves destinations to scratch
+  registers that the per-tap check refused. That was the upscaler's last compute pass, so the final
+  image held only the HUD.
+- **`CALL.REL.NOINC` is captured as a call** (`program_capture.h`), `SHF.R.U64` no longer clamps its
+  shift, and an occlusion query no longer starts on a deferred clear, which began it outside the render
+  pass.
+
+### Added
+- **Hand port of Lichii's OOT shader work** (PR #87 up to 4435506c96, plus 325e0a867b):
+  - The full register shadow list, and opcodes `0x4a4`, `0x243`, `0x499` and `0xc07`.
+  - F32 and signed reductions, signed REDUX, 64-bit shifts and negated F2I.
+  - UBREV, UFLO and UPOPC on every uniform register, guarded UISETP and USEL, and ISETP.EX with
+    accumulation.
+  - Array gathers, UIADD3 carry forms, and global atomic add and umax in SPIR-V.
+- **Lichii's pointer tracker in the global memory pass** (`global_memory_to_storage_buffer_pass.cpp`),
+  alongside our pruned search. Its `coherent` flag on loads is left out.
+- `KeplerCompute::SizesStorageBuffersFromMapping()`: OOT's native dispatches size storage buffers from
+  their mappings, as game DLSS passes do. `EDEN_NX2_OOT_MAPPED_SSBO=0` turns it off for OOT.
+- `EDEN_NX2_METHOD_RUN=0` turns `CallMethodRun` off, for bisecting.
+
+### Changed
+- **Shader cache version 22.** Caches written with the shader reuse bug have no storage pointer
+  classifications, so their pipelines failed at boot and stayed null for the session. Every game
+  rebuilds its shader cache once.
+- The DLSS chain only starts in Fortune's Weave, as in Lichii.
+
+### Internal
+- Tests: Lichii's exact-encoding tests and the exact words from OOT's rejections
+  (`ampere_lowering.cpp`).
+- Known: performance in OOT is uninvestigated (game speed dropped to 29% during shader builds, and one
+  compute pipeline took 18 s in the driver). Lichii's `fix/oot-boot` rejects the same upscaler pass and
+  still shows a picture, which is unexplained.
+
 ## [0.1.33] - 2026-11-04
 
 Brings in upstream `nx2` e736dfde9e (57 commits), mainly for OOT, which now gets past its startup

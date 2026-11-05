@@ -1,17 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <memory>
 #include <stdexcept>
 #include "common/container/unordered_map.h"
 #include <tuple>
 #include <vector>
 #include <optional>
+#include <random>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_types.h"
+#include "common/range_sets.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
+#include "video_core/nx2_clean_pages.h"
 #include "core/device_memory.h"
 #include "core/memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -83,6 +89,81 @@ private:
 } // Anonymous namespace
 
 using MemoryTracker = VideoCommon::MemoryTrackerBase<RasterizerInterface>;
+
+TEST_CASE("WordManager empty-word skips preserve ranges and tracking changes", "[video_core]") {
+    using VideoCommon::Type;
+    using Manager = VideoCommon::WordManager<RasterizerInterface, 16, HIGH_PAGE_SIZE>;
+    std::mt19937_64 random{0x504};
+    for (const auto type : {Type::CPU, Type::GPU, Type::CachedCPU, Type::Preflushable}) {
+        for (const bool clear : {false, true}) {
+            for (u32 trial = 0; trial < 100; ++trial) {
+                RasterizerInterface rasterizer;
+                Manager manager{c, rasterizer};
+                for (auto& word : manager.heap) {
+                    word = trial % 4 == 0 ? 0 : random();
+                }
+                if (trial % 4 == 1) {
+                    std::ranges::fill(manager.Span(type), 0);
+                }
+                auto expected = manager.heap;
+                std::vector<Range> expected_ranges;
+                std::vector<std::tuple<DAddr, u64, int>> expected_updates;
+                const u64 offset = trial == 0 ? 0 : random() % HIGH_PAGE_SIZE;
+                const u64 size = trial == 0 ? HIGH_PAGE_SIZE :
+                    random() % (HIGH_PAGE_SIZE - offset + 1);
+                const auto append = [](auto& ranges, u64 address) {
+                    if (!ranges.empty() && std::get<0>(ranges.back()) +
+                                               std::get<1>(ranges.back()) == address) {
+                        std::get<1>(ranges.back()) += PAGE;
+                    } else if constexpr (std::is_same_v<std::decay_t<decltype(ranges)>,
+                                                       std::vector<Range>>) {
+                        ranges.emplace_back(address, PAGE);
+                    } else {
+                        ranges.emplace_back(address, PAGE, 1);
+                    }
+                };
+                if (size != 0) {
+                    for (u64 page = offset / PAGE; page < (offset + size + PAGE - 1) / PAGE;
+                         ++page) {
+                        const u64 bit = u64{1} << (page % 64);
+                        const u64 index = page / 64;
+                        auto& state = expected[static_cast<size_t>(type) * 16 + index];
+                        auto& untracked = expected[static_cast<size_t>(Type::Untracked) * 16 + index];
+                        auto& cached = expected[static_cast<size_t>(Type::CachedCPU) * 16 + index];
+                        if (type == Type::GPU && (untracked & bit) != 0) {
+                            continue;
+                        }
+                        const bool modified = (state & bit) != 0;
+                        if (modified) {
+                            append(expected_ranges, c + page * PAGE);
+                        }
+                        if (!clear) {
+                            continue;
+                        }
+                        if (type == Type::CPU || type == Type::CachedCPU) {
+                            if ((untracked & bit) != 0) {
+                                append(expected_updates, c + page * PAGE);
+                            }
+                            untracked &= ~bit;
+                        }
+                        state &= ~bit;
+                        if (type == Type::CPU && modified) {
+                            cached &= ~bit;
+                        }
+                    }
+                }
+                std::vector<Range> actual_ranges;
+                manager.ForEachModifiedRange(type, clear, c + offset, size,
+                                             [&](u64 address, u64 length) {
+                                                 actual_ranges.emplace_back(address, length);
+                                             });
+                REQUIRE(actual_ranges == expected_ranges);
+                REQUIRE(manager.heap == expected);
+                REQUIRE(rasterizer.UpdateCallsList() == expected_updates);
+            }
+        }
+    }
+}
 
 TEST_CASE("MemoryTracker: Small region", "[video_core]") {
     RasterizerInterface rasterizer;
@@ -608,4 +689,191 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     ranges.emplace_back(Core::Memory::YUZU_PAGESIZE, Core::Memory::YUZU_PAGESIZE);
     manager.UpdatePagesCachedBatch(ranges, 1);
     SUCCEED("UpdatePagesCachedBatch executed without error");
+}
+
+TEST_CASE("MemoryTracker: overlapping readbacks clear each GPU page once", "[cpu_readback]") {
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker{rasterizer};
+    tracker.UnmarkRegionAsCpuModified(c, PAGE * 4);
+    tracker.MarkRegionAsGpuModified(c, PAGE * 3);
+
+    std::vector<Range> downloads;
+    const auto collect = [&](u64 address, u64 size) { downloads.emplace_back(address, size); };
+    tracker.ForEachDownloadRangeAndClear(c, PAGE * 2, collect);
+    tracker.ForEachDownloadRangeAndClear(c + PAGE, PAGE * 2, collect);
+    tracker.ForEachDownloadRangeAndClear(c, PAGE * 4, collect);
+    REQUIRE(downloads == std::vector<Range>{{c, PAGE * 2}, {c + PAGE * 2, PAGE}});
+    REQUIRE_FALSE(tracker.IsRegionGpuModified(c, PAGE * 4));
+}
+
+TEST_CASE("Consumed read traps rearm on the next GPU write", "[cpu_readback][read_traps]") {
+    VideoCommon::ReadTrapTracker traps;
+    // A GPU write protects both pages; repeated writes need no second core notification.
+    REQUIRE(traps.Arm(c, PAGE * 2));
+    REQUIRE_FALSE(traps.Arm(c, PAGE * 2));
+    REQUIRE_FALSE(traps.Arm(c, PAGE));
+
+    // The first CPU read consumes only its page. The next GPU write must notify the core again.
+    traps.Subtract(c, PAGE);
+    REQUIRE_FALSE(traps.Arm(c + PAGE, PAGE));
+    REQUIRE(traps.Arm(c, PAGE));
+    REQUIRE_FALSE(traps.Arm(c, PAGE));
+    traps.Subtract(c, PAGE);
+    REQUIRE(traps.Arm(c, PAGE));
+
+    // Unmapping the whole buffer must forget both pages before a later mapping reuses them.
+    traps.Subtract(c, PAGE * 2);
+    REQUIRE(traps.Arm(c, PAGE * 2));
+}
+
+TEST_CASE("MemoryTracker: a GPU rewrite needs a fresh CPU readback", "[cpu_readback]") {
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker{rasterizer};
+    tracker.UnmarkRegionAsCpuModified(c, PAGE * 2);
+    tracker.MarkRegionAsGpuModified(c, PAGE);
+    std::vector<Range> downloads;
+    const auto collect = [&](u64 address, u64 size) { downloads.emplace_back(address, size); };
+
+    tracker.ForEachDownloadRangeAndClear(c + PAGE, PAGE, collect);
+    REQUIRE(downloads.empty());
+    REQUIRE(tracker.IsRegionGpuModified(c, PAGE));
+    tracker.ForEachDownloadRangeAndClear(c, PAGE, collect);
+    REQUIRE(downloads == std::vector<Range>{{c, PAGE}});
+    REQUIRE_FALSE(tracker.IsRegionGpuModified(c, PAGE));
+    REQUIRE_FALSE(tracker.IsRegionPreflushable(c, PAGE));
+
+    tracker.MarkRegionAsGpuModified(c, PAGE);
+    REQUIRE(tracker.IsRegionGpuModified(c, PAGE));
+    downloads.clear();
+    tracker.ForEachDownloadRangeAndClear(c, PAGE, collect);
+    REQUIRE(downloads == std::vector<Range>{{c, PAGE}});
+    REQUIRE_FALSE(tracker.IsRegionGpuModified(c, PAGE));
+}
+
+TEST_CASE("CPU read range sets merge overlaps and forget deleted buffer spans", "[cpu_readback]") {
+    Common::RangeSet<DAddr> ranges;
+    ranges.Add(c, PAGE * 2);
+    ranges.Add(c + PAGE, PAGE * 2);
+    ranges.Add(c, PAGE * 2);
+    std::vector<Range> intersections;
+    const auto collect = [&](DAddr lower, DAddr upper) {
+        intersections.emplace_back(lower, upper - lower);
+    };
+    ranges.ForEachInRange(c, PAGE * 4, collect);
+    REQUIRE(intersections == std::vector<Range>{{c, PAGE * 3}});
+
+    ranges.Subtract(c + PAGE, PAGE);
+    intersections.clear();
+    ranges.ForEachInRange(c + PAGE, PAGE, collect);
+    REQUIRE(intersections.empty());
+    ranges.ForEachInRange(c, PAGE * 4, collect);
+    REQUIRE(intersections == std::vector<Range>{{c, PAGE}, {c + PAGE * 2, PAGE}});
+}
+
+// Lichii perf/nx2-fast-draw 528bafdd8 (EDEN_NX2_BUFFER_SKIP).
+TEST_CASE("MemoryTracker: synchronized range forgets overlapping CPU writes", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->ForEachUploadRange(c, PAGE * 4, [](u64, u64) {});
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->MarkRegionAsCpuModified(c + PAGE * 4, PAGE);
+    memory_track->MarkRegionAsGpuModified(c, PAGE);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->MarkRegionAsCpuModified(c + PAGE * 3, 1);
+    REQUIRE(!memory_track->IsSynchronized(3));
+
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    memory_track->CachedCpuWrite(c + PAGE * 6, PAGE);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->FlushCachedWrites();
+    REQUIRE(!memory_track->IsSynchronized(3));
+
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    memory_track->ForgetSynchronized(3);
+    REQUIRE(!memory_track->IsSynchronized(3));
+}
+
+TEST_CASE("MemoryTracker: a synchronized range has nothing to upload", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    std::mt19937 rng{20261104};
+    const auto random_range = [&]() -> Range {
+        const u64 begin = c + (rng() % 120) * PAGE + (rng() % 2) * 100;
+        return {begin, 1 + rng() % (PAGE * 8)};
+    };
+    std::array<Range, 4> watched{};
+    for (int step = 0; step < 20000; ++step) {
+        const auto [addr, size] = random_range();
+        switch (rng() % 7) {
+        case 0:
+            memory_track->MarkRegionAsCpuModified(addr, size);
+            break;
+        case 1:
+            memory_track->CachedCpuWrite(addr, size);
+            break;
+        case 2:
+            memory_track->FlushCachedWrites();
+            break;
+        case 3:
+            memory_track->MarkRegionAsGpuModified(addr, size);
+            break;
+        case 4:
+            memory_track->UnmarkRegionAsCpuModified(addr, size);
+            break;
+        default: {
+            const u32 slot = rng() % 4;
+            memory_track->ForEachUploadRange(addr, size, [](u64, u64) {});
+            memory_track->WatchSynchronized(slot, addr, size);
+            watched[slot] = {addr, size};
+            break;
+        }
+        }
+        for (u32 slot = 0; slot < 4; ++slot) {
+            if (!memory_track->IsSynchronized(slot)) {
+                continue;
+            }
+            const size_t calls = rasterizer.UpdateCallsList().size();
+            int uploads = 0;
+            memory_track->ForEachUploadRange(watched[slot].first, watched[slot].second,
+                                             [&](u64, u64) { ++uploads; });
+            REQUIRE(uploads == 0);
+            REQUIRE(rasterizer.UpdateCallsList().size() == calls);
+        }
+    }
+}
+
+// Lichii perf/nx2-fast-draw 2a9c62626 (EDEN_NX2_INLINE_INVALIDATE).
+TEST_CASE("Clean pages remember only pages a cache held nothing on", "[fast_draw]") {
+    VideoCommon::Nx2CleanPages pages;
+    constexpr DAddr base = 0x10'0000;
+    constexpr size_t Page = 0x1000;
+    u64 serial = 7;
+    std::vector<DAddr> touched{base + Page};
+    const auto clean_serial = [&](DAddr addr, size_t size) -> u64 {
+        for (const DAddr held : touched) {
+            if (held < addr + size && addr < held + 4) {
+                return 0;
+            }
+        }
+        return serial;
+    };
+    CHECK_FALSE(pages.Contains(base, 0x40, serial));
+    pages.Fill(base, Page * 2, clean_serial);
+    CHECK(pages.Contains(base + 0x100, 0x40, serial));
+    // The second page holds something: a range reaching into it is still invalidated.
+    CHECK_FALSE(pages.Contains(base + Page - 0x20, 0x40, serial));
+    CHECK_FALSE(pages.Contains(base + Page, 0x40, serial));
+    // The cache starts holding something new: nothing remembered counts.
+    ++serial;
+    CHECK_FALSE(pages.Contains(base + 0x100, 0x40, serial));
+    // Long ranges aren't remembered.
+    touched.clear();
+    pages.Fill(base, Page * 17, clean_serial);
+    CHECK_FALSE(pages.Contains(base, 0x40, serial));
+    pages.Fill(base, Page * 16, clean_serial);
+    CHECK(pages.Contains(base, Page * 16, serial));
+    // A page that maps to the same entry replaces it.
+    pages.Fill(base + Page * VideoCommon::Nx2CleanPages::Size, 0x40, clean_serial);
+    CHECK_FALSE(pages.Contains(base, 0x40, serial));
 }

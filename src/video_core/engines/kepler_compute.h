@@ -246,10 +246,19 @@ public:
     bool IsNativeMode() const { return native_mode; }
     /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
+    /// Whether the dispatch's storage buffers are sized from their mappings: game DLSS passes, and
+    /// every native dispatch of Ocarina of Time.
+    [[nodiscard]] bool SizesStorageBuffersFromMapping() const;
+    /// Whether Ocarina of Time is running with its storage buffers sized from their mappings, in
+    /// graphics stages too (EDEN_NX2_OOT_MAPPED_SSBO=0 turns it off).
+    [[nodiscard]] static bool OcarinaSizesStorageBuffersFromMapping();
     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
     /// for Donkey Kong Bananza.
     [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
+    /// Whether the host emulates matrix multiplies outside those cases (Lichii #143: not on Mesa's
+    /// Intel driver, where the upscale stand-in draws instead).
+    [[nodiscard]] bool HostEmulatesNativeTensorPrograms() const;
     /// Whether the program being dispatched belongs to a recognized game DLSS evaluation.
     [[nodiscard]] bool FollowsDlssEvaluation() const { return dlss_chain.active; }
 

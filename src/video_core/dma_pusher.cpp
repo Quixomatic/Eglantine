@@ -8,8 +8,10 @@
 #include <map>
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
+#include <vector>
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -30,6 +32,17 @@
 namespace Tegra {
 
 constexpr u32 MacroRegistersStart = 0xE00;
+
+// EDEN_NX2_EXEC_WRITERS=0: every compute and copy engine write counts as a possible command
+// list writer (GpuSplit::NoteWriter), not only launches (Lichii #161).
+static bool ExecutableWritersOnly() {
+    static const bool only = [] {
+        const char* value = std::getenv("EDEN_NX2_EXEC_WRITERS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return only;
+}
+
 constexpr u32 ComputeInline = 0x6D;
 
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
@@ -121,6 +134,10 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        // A GP entry's sync bit is a host-level wait (GpuSplit::WaitForSyncedWriters).
+        if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
+            VideoCommon::GpuSplit::Get().NoteSync();
+        }
         // The entry is the 5-word record of a DrawIndexedIndirect call the host GPU draws from
         // guest memory (Maxwell3D::FrontTakeIndirectRecord): its words are not needed fresh.
         bool indirect_record_entry = false;
@@ -216,7 +233,7 @@ bool DmaPusher::Step() {
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
                         engine_state->current_dirty = memory->IsMemoryDirty(address, bytes);
-                    });
+                    }, VideoCommon::GpuSplit::FastDrawNeutral);
                 } else {
                     engine_state->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
                 }
@@ -263,8 +280,10 @@ bool DmaPusher::Step() {
         // billions of instances and lost the device loading a race).
         bool gpu_written = !skip_record_read &&
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        // Only the writers before the last host-level wait (Lichii #161): the guest syncs before
+        // it reads commands GPU work wrote. EDEN_NX2_SYNCED_WRITERS=0 waits for all of them.
         if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
+            VideoCommon::GpuSplit::Get().WaitForSyncedWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
@@ -274,6 +293,9 @@ bool DmaPusher::Step() {
         // read: their words at submit time are an older frame's.
         const bool submitted = command_resume_offset == 0 &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                               !std::ranges::binary_search(
+                                   command_list.deferred_entries,
+                                   static_cast<u32>(dma_pushbuffer_subindex)) &&
                                (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
                                    suspensions.load(std::memory_order_acquire) &&
@@ -378,6 +400,31 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             dma_state.is_last_call = true;
             index += max_write;
         } else if (dma_state.method_count) {
+            // Lichii #161: consecutive constant buffer data words go as one multi-method call
+            // (one split entry) instead of one call each. EDEN_NX2_CB_BATCH=0 turns it off.
+            static const bool cb_batch = [] {
+                const char* value = std::getenv("EDEN_NX2_CB_BATCH");
+                return value == nullptr || value[0] != '0';
+            }();
+            constexpr u32 cb_data =
+                offsetof(Engines::Maxwell3D::Regs, const_buffer.buffer) / sizeof(u32);
+            if (cb_batch && !dma_state.non_incrementing && !dma_increment_once &&
+                dma_state.method >= cb_data && dma_state.method < cb_data + 16 &&
+                subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+                subchannels[dma_state.subchannel] != nullptr && g_semaphore_watch == 0) {
+                const u32 batch = static_cast<u32>((std::min<size_t>)(
+                    {size_t{dma_state.method_count}, commands.size() - index,
+                     size_t{cb_data + 16 - dma_state.method}}));
+                if (batch > 1) {
+                    dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
+                    CallMultiMethod(&commands[index].argument, batch);
+                    dma_state.method += batch;
+                    dma_state.method_count -= batch;
+                    dma_state.is_last_call = true;
+                    index += batch;
+                    continue;
+                }
+            }
             // Fast-path batching for consecutive non-execution methods in increasing mode
             if (!dma_state.non_incrementing && !dma_increment_once &&
                 dma_state.method >= non_puller_methods &&
@@ -408,11 +455,17 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             auto const command_header = commands[index]; //can copy
             dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
+            const u32 called_method = dma_state.method;
             CallMethod(command_header.argument);
-            dma_state.method += !dma_state.non_incrementing ? 1 : 0;
+            dma_state.method += static_cast<u32>(!dma_state.non_incrementing);
             dma_state.non_incrementing |= dma_increment_once;
             dma_state.method_count--;
             index++;
+            // Only puller methods can suspend the channel (Lichii #161).
+            if (called_method < non_puller_methods && puller.HasPendingAcquire()) {
+                return index;
+            }
+            continue;
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
@@ -445,7 +498,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             }
             index++;
         }
-        if (puller.HasPendingAcquire()) {
+        if (dma_state.method < non_puller_methods && puller.HasPendingAcquire()) {
             return index;
         }
     }
@@ -537,12 +590,17 @@ void DmaPusher::CallMethod(u32 argument) {
             return;
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        // Only their executable methods (launches) and macros can (Lichii #161).
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = (engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA) &&
+                            (!ExecutableWritersOnly() || dma_state.method >= MacroRegistersStart ||
+                             (dma_state.method < subchannel->execution_mask.size() &&
+                              subchannel->execution_mask[dma_state.method]));
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                split.NoteAnyRelease();
             }
         };
         if (split.Active()) {
@@ -596,12 +654,23 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             return;
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+        // Only their executable methods (launches) and macros can (Lichii #161).
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        bool writer = false;
+        if (engine_type == Engines::EngineTypes::KeplerCompute ||
+            engine_type == Engines::EngineTypes::MaxwellDMA) {
+            writer = !ExecutableWritersOnly();
+            const u32 check_count = dma_state.non_incrementing ? 1U : num_methods;
+            for (u32 i = 0; !writer && i < check_count; ++i) {
+                const u32 m = dma_state.method + i;
+                writer = m >= MacroRegistersStart ||
+                         (m < subchannel->execution_mask.size() && subchannel->execution_mask[m]);
+            }
+        }
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                split.NoteAnyRelease();
             }
         };
         if (split.Active()) {
@@ -646,6 +715,23 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
         memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
                                        entry.size * sizeof(u32));
     }
+    list.deferred_entries.clear();
+}
+
+void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+    for (const u32 i : list.deferred_entries) {
+        if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
+            continue;
+        }
+        const CommandListHeader& entry = list.command_lists[i];
+        const u32 offset = list.submitted_offsets[i];
+        if (offset + entry.size > list.submitted_words.size()) {
+            continue;
+        }
+        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
+                                       entry.size * sizeof(u32));
+    }
+    list.deferred_entries.clear();
 }
 
 bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
@@ -728,8 +814,23 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::Nx2Profile::DrainSite::GpuWrittenParams);
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
-    if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
-                                     VideoCommon::CacheType::BufferCache)) {
+    // Lichii perf/dkb-front-waits: the other pages draws wrote since their last flush go along in
+    // the same GPU round trip, so their next lists read guest memory instead of draining and
+    // flushing again. EDEN_NX2_CMDPAGE_BATCH=0 flushes this entry's pages only, as before.
+    static const bool batch = [] {
+        const char* value = std::getenv("EDEN_NX2_CMDPAGE_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (batch && rasterizer != nullptr) {
+        std::vector<DAddr> pages;
+        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                pages.push_back(*device);
+            }
+        }
+        rasterizer->FlushGpuWrittenCommandListPages(pages);
+    } else if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
+                                            VideoCommon::CacheType::BufferCache)) {
         memory_manager.FlushRegion(first_page, end_page - first_page,
                                    VideoCommon::CacheType::BufferCache);
     }

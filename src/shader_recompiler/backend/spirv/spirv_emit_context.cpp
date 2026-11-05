@@ -524,7 +524,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
-    DefineGlobalMemoryFunctions(program.info);
+    DefineGlobalMemoryFunctions(program);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
 }
@@ -979,7 +979,8 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
     write_storage_cas_loop_func = func;
 }
 
-void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
+void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+    const Info& info{program.info};
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
@@ -995,8 +996,34 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             const Id ssbo_addr_pointer{OpAccessChain(uniform_types.U32x2,
                                                      cbufs[ssbo.cbuf_index].U32x2, zero,
                                                      Const(ssbo.cbuf_offset / 8))};
-            const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
-            return OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask));
+            const Id words{OpLoad(U32[2], ssbo_addr_pointer)};
+            if (ssbo.indirect_offset == ~0U) {
+                return OpBitwiseAnd(U64, OpBitcast(U64, words), Constant(U64, ssbo_align_mask));
+            }
+            // The pointer is read through the buffer bound for the constant buffer pointer.
+            const auto holder{std::ranges::find_if(
+                info.storage_buffers_descriptors, [&ssbo](const auto& desc) {
+                    return desc.cbuf_index == ssbo.cbuf_index &&
+                           desc.cbuf_offset == ssbo.cbuf_offset && desc.indirect_offset == ~0U;
+                })};
+            if (holder == info.storage_buffers_descriptors.end()) {
+                return Constant(U64, ~u64{0});
+            }
+            const size_t holder_index{static_cast<size_t>(
+                std::distance(info.storage_buffers_descriptors.begin(), holder))};
+            const Id holder_low{OpCompositeExtract(U32[1], words, 0U)};
+            const Id byte{OpIAdd(U32[1],
+                                 OpBitwiseAnd(U32[1], holder_low,
+                                              Const(static_cast<u32>(profile.min_ssbo_alignment - 1))),
+                                 Const(ssbo.indirect_offset))};
+            const Id word_index{OpShiftRightLogical(U32[1], byte, Const(2U))};
+            const Id storage{ssbos[holder_index].U32};
+            const auto load_word{[&](Id word) {
+                return OpLoad(U32[1], OpAccessChain(storage_types.U32.element, storage, zero, word));
+            }};
+            const Id pointer_words{OpCompositeConstruct(
+                U32[2], load_word(word_index), load_word(OpIAdd(U32[1], word_index, Const(1U))))};
+            return OpBitwiseAnd(U64, OpBitcast(U64, pointer_words), Constant(U64, ssbo_align_mask));
         }};
         const auto access{[&](size_t index, Id ssbo_addr, Id cond) {
             const Id then_label{OpLabel()};
@@ -1084,6 +1111,62 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         define(&StorageDefinitions::U32x2, storage_types.U32x2, U32[2], sizeof(u32[2]));
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
+
+    if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
+            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
+        })) {
+        return;
+    }
+    for (const auto opcode : {IR::Opcode::GlobalAtomicIAdd32, IR::Opcode::GlobalAtomicUMax32}) {
+        if (!std::ranges::any_of(program.blocks, [opcode](const IR::Block* block) {
+                return std::ranges::any_of(block->Instructions(), [opcode](const IR::Inst& inst) {
+                    return inst.GetOpcode() == opcode;
+                });
+            })) {
+            continue;
+        }
+        const Id function_type{TypeFunction(U32[1], U64, U32[1])};
+        const Id function{OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type)};
+        if (opcode == IR::Opcode::GlobalAtomicIAdd32) {
+            atomic_add_global_func_u32 = function;
+        } else {
+            atomic_umax_global_func_u32 = function;
+        }
+        const Id address{OpFunctionParameter(U64)};
+        const Id value{OpFunctionParameter(U32[1])};
+        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+                    [&](Id pointer) {
+                        OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
+                                          ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
+                                          : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
+                    });
+        OpReturnValue(u32_zero_value);
+        OpFunctionEnd();
+    }
+    // Lichii #140: global compare-exchange routed to the buffer holding the address.
+    if (std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+            return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
+                return inst.GetOpcode() == IR::Opcode::GlobalAtomicCompareExchange32;
+            });
+        })) {
+        const Id function_type{TypeFunction(U32[1], U64, U32[1], U32[1])};
+        atomic_cas_global_func_u32 =
+            OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
+        const Id address{OpFunctionParameter(U64)};
+        const Id comparator{OpFunctionParameter(U32[1])};
+        const Id value{OpFunctionParameter(U32[1])};
+        const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+        define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
+                    [&](Id pointer) {
+                        OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
+                                                              u32_zero_value, u32_zero_value,
+                                                              value, comparator));
+                    });
+        // No buffer matched: report success so a guest CAS retry loop cannot spin forever.
+        OpReturnValue(comparator);
+        OpFunctionEnd();
+    }
 }
 
 void EmitContext::DefineRescalingInput(const Info& info) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -11,14 +12,11 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/engines/engine_interface.h"
 #include "video_core/nx2_profile.h"
 
 namespace Core {
 class System;
-}
-
-namespace Tegra::Engines {
-class EngineInterface;
 }
 
 namespace VideoCommon {
@@ -86,6 +84,9 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (engine->memory_write_mask[method]) {
+            last_memory_write_position = write_position;
+        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
@@ -94,6 +95,9 @@ public:
     /// instead of dispatching an entry per write: ~2.5 million writes a second in DK Bananza).
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
         SelectEngine(engine);
+        // A memory-writing macro write (Lichii perf/dkb-front-waits): the back passes the position
+        // after it only once it ran the whole Run entry holding it.
+        const bool writes_memory = engine->memory_write_mask[method];
         const u64 word = (u64{method & 0xffff} << 8) | (u64{argument} << 32);
         if (open_run != nullptr && open_run_end == write_position &&
             ((open_run[0] >> 8) & 0xffffff) < MaxRunWrites) {
@@ -107,6 +111,9 @@ public:
                 if (open_run != nullptr) {
                     open_run_end = write_position;
                 }
+                if (writes_memory) {
+                    last_memory_write_position = write_position;
+                }
                 return;
             }
             open_run = nullptr;
@@ -119,15 +126,22 @@ public:
         if (open_run != nullptr) {
             open_run_end = write_position;
         }
+        if (writes_memory) {
+            last_memory_write_position = write_position;
+        }
     }
 
+    /// Defer flag: the call doesn't end EDEN_NX2_FAST_DRAW reuse (nx2_fast_draw.h).
+    static constexpr u64 FastDrawNeutral = 1 << 7;
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func) {
+    void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
@@ -150,9 +164,53 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::WriterWait);
+    /// As WaitForWriters, but only for the writers sent before the last host-level wait
+    /// (NoteSync): the guest can't expect later ones to be done (Lichii #161).
+    /// EDEN_NX2_SYNCED_WRITERS=0 waits for all writers, as WaitForWriters.
+    bool WaitForSyncedWriters(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::WriterWait);
+    /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
+    /// bit, a semaphore acquire): the guest's GPU work before it is complete before the
+    /// commands after it are fetched.
+    void NoteSync() {
+        last_sync_position = write_position;
+    }
+    /// Waits until the back executed the work sent before the last NoteSync.
+    bool WaitForSync(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::CommandSync);
+    /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
+    void NoteMemoryWrite() {
+        last_memory_write_position = write_position;
+    }
+    /// For the front's macro memory reads (MME DMA, Lichii perf/dkb-front-waits): waits until the
+    /// back executed the methods that write memory in command order (memory_write_mask,
+    /// NoteMemoryWrite), the compute and copy work and the work before the last host-level wait,
+    /// all sent so far.
+    bool WaitForMemoryWriters(Nx2Profile::DrainSite site);
+
+    /// Semaphore releases sent to the back, by address hash (Lichii #161): an acquire whose value
+    /// is already met needs the back only up to the last release that may have written it.
+    static constexpr size_t SemSlot(u64 addr) noexcept {
+        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10) ^ (addr >> 18)) & 63U);
+    }
+    void NoteSemaphoreWrite(u64 addr) noexcept {
+        sem_write_positions[SemSlot(addr)] = write_position;
+        last_release_position = write_position;
+    }
+    /// Work that may release semaphores at addresses the front doesn't see (compute, copies).
+    void NoteAnyRelease() noexcept {
+        last_release_position = write_position;
+    }
+    [[nodiscard]] u64 LastReleasePosition() const noexcept {
+        return last_release_position;
+    }
+    bool WaitForSemaphore(u64 addr, Nx2Profile::DrainSite site = Nx2Profile::DrainSite::Puller) {
+        return WaitFor(sem_write_positions[SemSlot(addr)], site);
+    }
 
 private:
+    /// Waits until the back consumed `target`. Returns whether it had not yet.
+    bool WaitFor(u64 target, Nx2Profile::DrainSite site);
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -215,6 +273,10 @@ private:
     // Front side.
     alignas(128) u64 write_position{};
     u64 last_writer_position{};
+    u64 last_sync_position{};
+    u64 last_memory_write_position{};
+    u64 last_release_position{};
+    std::array<u64, 64> sem_write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -241,6 +303,9 @@ private:
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
+    /// The front sleeps on front_wake in WaitFor; the back bumps it once past wait_target.
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
 };
 
 } // namespace VideoCommon

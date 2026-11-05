@@ -550,7 +550,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     // Fortune's Weave's DLSS evaluation runs from its first pass to the pass that writes the
     // upscaled image. Its inputs are kept from the first pass for a replacement upscale.
-    if (RememberDlssMotionVectors()) {
+    constexpr u64 FortunesWeaveProgramId = 0x04007EF01F8AE000ULL;
+    if (Settings::GetCurrentProgramID() == FortunesWeaveProgramId && RememberDlssMotionVectors()) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
@@ -640,6 +641,19 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
+bool KeplerCompute::OcarinaSizesStorageBuffersFromMapping() {
+    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    static const bool ocarina_sizing = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_MAPPED_SSBO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return ocarina_sizing && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId;
+}
+
+bool KeplerCompute::SizesStorageBuffersFromMapping() const {
+    return native_mode && (dlss_chain.active || OcarinaSizesStorageBuffersFromMapping());
+}
+
 bool KeplerCompute::EmulatesNativeTensorPrograms() const {
     if (dlss_chain.active) {
         return dlss_chain.failure == VideoCore::GameDlssReason::None &&
@@ -651,6 +665,10 @@ bool KeplerCompute::EmulatesNativeTensorPrograms() const {
     // shader cache keeps the result of a program's first dispatch.
     constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
     return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId;
+}
+
+bool KeplerCompute::HostEmulatesNativeTensorPrograms() const {
+    return rasterizer == nullptr || rasterizer->EmulatesNativeTensorPrograms();
 }
 
 // Checks the network's output against its input (on the GPU; the result arrives a few frames
@@ -916,9 +934,47 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         output = image(0x348);
         fortunes_weave = upscale_pair(input, output);
     }
+    bool rgb9e5_pair = false;
     if (!upscale_pair(input, output)) {
         input.reset();
         output.reset();
+        // Ocarina of Time's gameplay network reads the frame packed as RGB9E5, each channel the
+        // square root of the tonemapped value, and writes a B10G11R11 image at least as wide
+        // (Lichii #143). Its constant buffer keeps stale handles (a bloom level at +0xa0) that the
+        // scan below pairs with the output, so this pair goes first: the widest B10G11R11 image
+        // when nothing in the pass is wider, from the widest RGB9E5 image of the same aspect at
+        // most 4x narrower.
+        const u32 limit = (std::min)(cbuf.size.Value(), 0x200U);
+        u32 widest = 0;
+        for (u32 offset = 0; offset + 4 <= limit; offset += 4) {
+            const auto tic = memory_manager.Read<u32>(cbuf_address + offset) != 0 ? image(offset)
+                                                                                     : std::nullopt;
+            if (!tic || tic->Address() == 0 || !tic->IsBlockLinear()) continue;
+            widest = (std::max)(widest, tic->Width());
+            if (tic->format == Texture::TextureFormat::B10G11R11 &&
+                (!output || tic->Width() > output->Width())) {
+                output = tic;
+            }
+            if (tic->format == Texture::TextureFormat::E5B9G9R9 &&
+                (!input || tic->Width() > input->Width())) {
+                input = tic;
+            }
+        }
+        rgb9e5_pair = [&] {
+            if (!input || !output || output->Width() != widest || input->Width() > widest ||
+                4 * input->Width() < widest) {
+                return false;
+            }
+            const u64 cross_a = u64{input->Width()} * output->Height();
+            const u64 cross_b = u64{output->Width()} * input->Height();
+            return (std::max)(cross_a, cross_b) - (std::min)(cross_a, cross_b) <= cross_b / 50;
+        }();
+        if (!rgb9e5_pair) {
+            input.reset();
+            output.reset();
+        }
+    }
+    if (!input) {
         for (u32 first = 0x80; first < 0x120 && !input; first += 4) {
             const auto from = memory_manager.Read<u32>(cbuf_address + first) != 0 ? image(first)
                                                                                     : std::nullopt;
@@ -936,17 +992,21 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     if (!input || !output)
         return false;
     using RTFormat = Tegra::RenderTargetFormat;
-    RTFormat format{};
-    switch (input->format) {
-    case Texture::TextureFormat::A2B10G10R10: format = RTFormat::A2B10G10R10_UNORM; break;
-    case Texture::TextureFormat::A8B8G8R8: format = RTFormat::A8B8G8R8_UNORM; break;
-    case Texture::TextureFormat::B10G11R11: format = RTFormat::B10G11R11_FLOAT; break;
-    case Texture::TextureFormat::R16G16B16A16: format = RTFormat::R16G16B16A16_FLOAT; break;
-    default: return false;
-    }
+    const auto rt_format = [](Texture::TextureFormat format) -> std::optional<RTFormat> {
+        switch (format) {
+        case Texture::TextureFormat::A2B10G10R10: return RTFormat::A2B10G10R10_UNORM;
+        case Texture::TextureFormat::A8B8G8R8: return RTFormat::A8B8G8R8_UNORM;
+        case Texture::TextureFormat::B10G11R11: return RTFormat::B10G11R11_FLOAT;
+        case Texture::TextureFormat::R16G16B16A16: return RTFormat::R16G16B16A16_FLOAT;
+        case Texture::TextureFormat::E5B9G9R9: return RTFormat::E5B9G9R9_FLOAT;
+        default: return std::nullopt;
+        }
+    };
+    if (!rt_format(input->format) || !rt_format(output->format))
+        return false;
     const auto surface = [&](const Texture::TICEntry& tic) {
         Fermi2D::Surface result{};
-        result.format = format;
+        result.format = *rt_format(tic.format);
         result.linear = Fermi2D::MemoryLayout::BlockLinear;
         result.block_width.Assign(tic.block_width);
         result.block_height.Assign(tic.block_height);
@@ -982,8 +1042,9 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
                  known->second ? "decodes sRGB like the program" : "plain copy");
     }
     const Fermi2D::Config config{
-        .operation = known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
-                                   : Fermi2D::Operation::SrcCopy,
+        .operation = rgb9e5_pair      ? Fermi2D::Operation::SrcCopySquare
+                     : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
+                                     : Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Bilinear,
         .must_accelerate = true,
         .dst_x0 = 0,
