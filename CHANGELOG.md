@@ -7,6 +7,42 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.33] - 2026-11-04
+
+Brings in upstream `nx2` e736dfde9e (57 commits), mainly for OOT, which now gets past its startup
+abort. Donkey Kong Bananza's open map holds 25.3 fps (1% low 20.8 against 22.9 before the merge, one
+run each; facing away 60 fps, 1% low 51.0 against 55.2), rendering unchanged (baseline 0.959).
+
+### Added
+- **Upstream's work since the last merge**, among them: `WaitForAddress` arbitration type 3
+  (`WaitIfEqual64`, the OOT fix), Phi nodes of more types in the SPIR-V backend, the H0_NH1 half
+  source fix, the NUP update's display version in the game list tooltip and NUP fixes, updated shared
+  font data, the Polish language code, the subgroup size check for compute pipelines, and conditional
+  barriers on Intel's ANV driver.
+
+### Changed
+- **Upstream removed the "Use the game's own DLSS" setting.** The game's network runs where it can,
+  and `EDEN_NX2_DLSS_REPLACEMENT` still asks for the replacement.
+- HMMA emulation stays on by default outside recognized game DLSS evaluations, where upstream limits
+  it to Donkey Kong Bananza.
+
+### Not taken from upstream
+- **Donkey Kong Bananza's wait for every frame at present (#506).** It is meant to stop freezes and
+  rubberbanding, but it took the open map from 25.2 to 19.0 fps and the view away from it from 60 to
+  37. `EDEN_NX2_FRAMES_AHEAD=0` turns it on.
+- **Upstream's new CI pipeline** (`ci.yml` and the workflows, scripts and `VERSION` file that go with
+  it). `dev` is this fork's default branch, so its daily schedule would run here and publish
+  pre-releases. `release-binaries.yml` stays.
+- **Mapped-size storage buffers on every native compute dispatch (#535).** Only game DLSS passes use
+  them, as upstream's #561 did before it was reverted (#569; #571 is open to restore it): it measured
+  Hyrule Warriors falling from 42-57 fps to about 2, then hanging.
+
+### Internal
+- Merge choices, per file: both sides in `nx2_gsv.h` (`mkw_smooth` and upstream's `ran_ahead` stat)
+  and `StorageBufferBinding` (`layout_size_memo` and the native pointer sizing); upstream's UISETP
+  and global address test, which match ours in logic; our `CHANGELOG.md`.
+- Tests pass (196 cases, run before the frame wait was taken out, which changed only `nx2_gsv.h`).
+
 ## [0.1.32] - 2026-11-04
 
 The release workflow no longer loses a whole release to one warning or one stalled download.
