@@ -41,6 +41,8 @@ u32 TranslationReads::Ask(Shader::Environment& env, Query query, u32 arg0, u32 a
         return env.HasHLEMacroState() ? 1 : 0;
     case Query::StorageBufferPointer:
         return env.IsCbufStorageBufferPointer(arg0, arg1) ? 1 : 0;
+    case Query::IndirectStorageBufferPointer:
+        return env.IsCbufIndirectStorageBufferPointer(arg0 & 0xff, arg0 >> 8, arg1) ? 1 : 0;
     }
     UNREACHABLE_MSG("Unknown environment query {}", static_cast<u32>(query));
 }
@@ -109,6 +111,11 @@ bool RecordingEnvironment::IsNativeProgram() const {
 
 bool RecordingEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     return AskAndRecord(TranslationReads::Query::StorageBufferPointer, index, offset) != 0;
+}
+
+bool RecordingEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    return AskAndRecord(TranslationReads::Query::IndirectStorageBufferPointer,
+                        index | (offset << 8), indirect) != 0;
 }
 
 // Instructions and program addresses are not recorded: they are the program's code, which its

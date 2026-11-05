@@ -249,6 +249,9 @@ public:
     /// Whether the dispatch's storage buffers are sized from their mappings: game DLSS passes, and
     /// every native dispatch of Ocarina of Time.
     [[nodiscard]] bool SizesStorageBuffersFromMapping() const;
+    /// Whether Ocarina of Time is running with its storage buffers sized from their mappings, in
+    /// graphics stages too (EDEN_NX2_OOT_MAPPED_SSBO=0 turns it off).
+    [[nodiscard]] static bool OcarinaSizesStorageBuffersFromMapping();
     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
     /// for Donkey Kong Bananza.

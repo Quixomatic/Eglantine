@@ -7,6 +7,37 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.37] - 2026-11-05
+
+Ocarina of Time's grass and foliage render, and its 3D stays at full resolution. Foliage still flashes
+white while the player moves and for about 15-20 seconds after stopping. A sample with these changes
+reads about 21 fps (1% low about 17) where v0.1.36 read about 39 at another spot, so the two are not
+directly comparable. Donkey Kong Bananza was not measured.
+
+### Added
+- **Storage buffers behind dynamic and loaded pointers** (Lichii `d854ff0de`, `f9acc60a5`, on its test
+  branches). Native programs bind every mapped slot of a pointer array read at a computed offset, and a
+  buffer whose pointer is loaded from a table in memory
+  (`StorageBufferDescriptor::indirect_offset`). The address walk follows `ShuffleIndex`, phis and selects
+  of table pointers, and table entries of compute programs use only free bindings. Table entries
+  are classified by `IsCbufIndirectStorageBufferPointer`, which `RecordingEnvironment` forwards and records.
+- **Pointer table pools bind to the end of their mapping, up to 64 MiB, when read-only** (Lichii
+  `4dcbd1cb9`), so grass instance records past 8 MiB read correctly.
+- **Built-in "Max Resolution" patch for OOT** (Lichii #124, still open there). It takes the game's own
+  branch for dynamic resolution disabled, checked against title, module, build id and the original
+  word, and a user mod at that word wins. It's listed in Add-Ons, where it can be turned off.
+
+### Changed
+- **OOT's graphics storage buffers are sized from their mappings** (from Lichii `37569c01d`, which does
+  this for every native game). `EDEN_NX2_OOT_MAPPED_SSBO=0` turns it off with the compute sizing.
+- **Shader cache version 24**: every game rebuilds its shader cache once.
+
+### Internal
+- `.plans/dk-perf-scripts/flash_oot.sh` counts one-capture white flashes from a screenshot burst.
+- Known: `read handles` takes about 300 ms/s of the GPU back thread in OOT's forest, and 4 compute
+  programs are rejected on `ULDC` indexed byte and 16-bit loads. All 207 tests pass. Lichii's tests for
+  the built-in patch and pointer forms are not ported.
+
 ## [0.1.36] - 2026-11-05
 
 Switch 2 query report timestamps are in nanoseconds, the unit of the other clocks these games read

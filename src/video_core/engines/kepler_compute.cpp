@@ -641,14 +641,17 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
-bool KeplerCompute::SizesStorageBuffersFromMapping() const {
+bool KeplerCompute::OcarinaSizesStorageBuffersFromMapping() {
     constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
     static const bool ocarina_sizing = [] {
         const char* value = std::getenv("EDEN_NX2_OOT_MAPPED_SSBO");
         return value == nullptr || value[0] != '0';
     }();
-    return native_mode && (dlss_chain.active ||
-                           (ocarina_sizing && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId));
+    return ocarina_sizing && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId;
+}
+
+bool KeplerCompute::SizesStorageBuffersFromMapping() const {
+    return native_mode && (dlss_chain.active || OcarinaSizesStorageBuffersFromMapping());
 }
 
 bool KeplerCompute::EmulatesNativeTensorPrograms() const {
