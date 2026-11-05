@@ -34,6 +34,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/buffer_cache/buffer_base.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/buffer_cache/virtual_range_cache.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/nx2.h"
@@ -524,6 +525,8 @@ private:
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
+    void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+
     void DeleteBuffer(BufferId buffer_id, bool do_not_mark = false);
 
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
@@ -637,22 +640,21 @@ private:
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
-    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// pages, which flushes them on demand (or marks them Preflushable with preflushing enabled).
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        u64 armed_bytes = 0;
-        read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
-            armed_bytes += upper - lower;
-        });
-        if (armed_bytes == end - begin) {
+        if (!read_trapped_ranges.Arm(begin, end - begin)) {
             return;
         }
-        read_trapped_ranges.Add(begin, end - begin);
         device_memory.ArmReadTraps(begin, end - begin);
     }
 
-    Common::RangeSet<DAddr> read_trapped_ranges;
+    ReadTrapTracker read_trapped_ranges;
+    /// Ranges the guest CPU read after GPU writes. A read that must flush downloads the GPU
+    /// writes in all of them, so the reads that usually follow it find nothing left to flush.
+    Common::RangeSet<DAddr> cpu_readback_ranges;
+    bool download_cpu_readback_ranges{};
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
     /// Buffer pages the guest CPU reads (NoteCpuRead). Without AsyncBufferDownloads, GPU writes
@@ -665,15 +667,40 @@ private:
     /// Queues a GPU write to [addr, addr + size): copied back at the next fence when downloads are
     /// on or the range was read by the guest CPU (Preflushable); else only the parts the CPU is known
     /// to read (cpu_read_ranges) are, and the rest traps the CPU's next read (ArmReadTraps).
+    /// With only Preflushable marks, just the marked pages are queued (Lichii #104): a write that
+    /// covers one marked page of a large buffer would otherwise copy the whole buffer back at every
+    /// fence. EDEN_NX2_EXACT_PREFLUSH=0 restores the old behaviour.
     void QueueDownload(DAddr addr, u64 size) {
-        if (DownloadsAtFence(addr, size)) {
+        static const bool exact = [] {
+            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(addr, size);
             return;
         }
-        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
-            uncommitted_gpu_modified_ranges.Add(start, end - start);
+        if (!exact && memory_tracker.IsRegionPreflushable(addr, size)) {
+            uncommitted_gpu_modified_ranges.Add(addr, size);
+            return;
+        }
+        const DAddr end = addr + size;
+        u64 queued = 0;
+        if (exact) {
+            memory_tracker.ForEachPreflushableRange(addr, size, [&](DAddr begin, u64 length) {
+                const DAddr lower = (std::max)(begin, addr);
+                const DAddr upper = (std::min)(begin + length, end);
+                if (lower < upper) {
+                    uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+                    queued += upper - lower;
+                }
+            });
+        }
+        cpu_read_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr range_end) {
+            uncommitted_gpu_modified_ranges.Add(start, range_end - start);
         });
-        ArmReadTraps(addr, size);
+        if (queued < size) {
+            ArmReadTraps(addr, size);
+        }
     }
 
 

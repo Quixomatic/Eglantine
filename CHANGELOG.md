@@ -7,6 +7,41 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.38] - 2026-11-05
+
+Ocarina of Time's foliage no longer flashes white while the camera moves, at Low GPU accuracy with the
+GPU thread split on, and the forest renders faster. Confirmed by the user in play. One sample in the
+forest read 23.1 fps (1% low 20.7) and 63,000 draws a second, against 20.6 (17.5) and 31,000 before,
+at a similar but not identical spot.
+
+### Fixed
+- **Guest CPU reads of GPU results were stale** (Lichii #147, still open there; its commit 23d33887a8).
+  Read pages of Switch 2 titles were marked preflushable after their first read, then only refreshed
+  at fences, so the game could read older GPU output: in OOT, occlusion results that hid the foliage
+  for a frame. These titles now keep read traps and flush on demand. A read that must flush downloads
+  every range the CPU has read back after GPU writes in one batch, with one GPU wait. Consumed traps
+  re-arm on the next GPU write. `EDEN_NX2_PREFLUSH=1` restores preflushing, `=0` forces flushing on
+  demand.
+- `DownloadMemory` clips each buffer's download to the requested range.
+
+### Changed
+- **GPU writes copy back only their preflushable pages at fences** (Lichii #104), instead of the whole
+  write. Our copy-back of CPU-read pages (Pokopia's sky) is kept. `EDEN_NX2_EXACT_PREFLUSH=0` turns it
+  off.
+- **`MaxContinuousRange` answers are cached per thread until the GPU page table changes** (Lichii #146).
+  Native storage buffer binds walked up to 8 MiB of pages each: `read handles` on the GPU back thread
+  299 -> 88 ms/s in that sample.
+- **The running occlusion query is capped at one bank across submissions** (Lichii #121's second
+  commit). OOT's title screen and file select count without resetting or reporting, so the query had
+  grown to 16,384 slots by the start of gameplay.
+
+### Internal
+- `ReadTrapTracker` (`buffer_cache/read_trap_tracker.h`) and Lichii's 4 readback tests. All 211 test
+  cases pass. Donkey Kong Bananza was not measured.
+- Known: 4 compute programs are still rejected on `ULDC` indexed byte and 16-bit loads.
+- The flash investigation found that GPU accuracy High or `gpu_fence_behavior=Balanced` also hid it,
+  which pointed at results reaching the game late. Its temporary diagnostics are not committed.
+
 ## [0.1.37] - 2026-11-05
 
 Ocarina of Time's grass and foliage render, and its 3D stays at full resolution. Foliage still flashes
