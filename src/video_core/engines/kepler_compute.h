@@ -256,6 +256,9 @@ public:
     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
     /// for Donkey Kong Bananza.
     [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
+    /// Whether the host emulates matrix multiplies outside those cases (Lichii #143: not on Mesa's
+    /// Intel driver, where the upscale stand-in draws instead).
+    [[nodiscard]] bool HostEmulatesNativeTensorPrograms() const;
     /// Whether the program being dispatched belongs to a recognized game DLSS evaluation.
     [[nodiscard]] bool FollowsDlssEvaluation() const { return dlss_chain.active; }
 

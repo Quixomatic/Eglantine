@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <bit>
 #include <numeric>
@@ -183,10 +185,20 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     // The reference is part of the pipeline only while the test compares with it: title 1
     // animates the register with the test off (text fading in and out), which made a new
     // pipeline, translated on the GPU thread, for every value (~84% of its runtime pipelines).
+    // Other titles fade with the test on, moving the reference by less than one step of 8-bit
+    // alpha per frame. Rounding it to 1/255 keeps those fades to one pipeline per step that
+    // the textures can tell apart (upstream #544 via Lichii #110: 925 -> 101 pipelines in a
+    // Fortune's Weave scene). EDEN_NX2_ALPHA_REF_ROUND=0 keeps the exact value.
+    static const bool round_alpha_ref = [] {
+        const char* value = std::getenv("EDEN_NX2_ALPHA_REF_ROUND");
+        return value == nullptr || value[0] != '0';
+    }();
     const u32 packed_alpha_test = alpha_test_func.Value();
     alpha_test_ref = packed_alpha_test != PackComparisonOp(Maxwell::ComparisonOp::Never_GL) &&
                              packed_alpha_test != PackComparisonOp(Maxwell::ComparisonOp::Always_GL)
-                         ? std::bit_cast<u32>(regs.alpha_test_ref)
+                         ? std::bit_cast<u32>(round_alpha_ref
+                                                  ? std::round(regs.alpha_test_ref * 255.0f) / 255.0f
+                                                  : regs.alpha_test_ref)
                          : 0;
     point_size = std::bit_cast<u32>(regs.point_size);
 

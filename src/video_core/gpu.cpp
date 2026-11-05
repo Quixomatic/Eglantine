@@ -30,9 +30,11 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
+#include "video_core/pending_maps.h"
 #include "video_core/gpu_timestamp.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
@@ -147,6 +149,7 @@ struct GPU::Impl {
             auto request = std::move(sync_requests.front());
             sync_requests.pop_front();
             sync_request_mutex.unlock();
+            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::TickWork);
             request();
             current_sync_fence.fetch_add(1, std::memory_order_release);
             sync_request_mutex.lock();
@@ -160,12 +163,22 @@ struct GPU::Impl {
             const char* value = std::getenv("EDEN_NX2_NS_TIMESTAMPS");
             return value == nullptr || value[0] != '0';
         }();
+        // EDEN_NX2_AMPERE_GPU_CLOCK=0: Boost and Overclock leave Switch 2 GPU time unscaled
+        // (Lichii #114 scales the time since the last present).
+        static const bool scale_ampere = [] {
+            const char* value = std::getenv("EDEN_NX2_AMPERE_GPU_CLOCK");
+            return value == nullptr || value[0] != '0';
+        }();
         return ReadGpuTimestamp(system.CoreTiming(),
                                 ns_timestamps && g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue());
+                                Settings::values.gpu_clock.GetValue(),
+                                scale_ampere ? present_ns.load(std::memory_order_relaxed)
+                                             : ~u64{0});
     }
 
     void RendererFrameEndNotify() {
+        present_ns.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
+                         std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -206,8 +219,18 @@ struct GPU::Impl {
         gpu_thread.Run(std::move(func), is_async);
     }
 
-    void MapInOrder(std::function<void()>&& func) {
-        gpu_thread.Run(std::move(func), is_async, true);
+    void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
+        const u64 id = pending_maps.Add(gpu_addr, size);
+        gpu_thread.Run(
+            [this, id, func = std::move(func)] {
+                func();
+                pending_maps.Remove(id);
+            },
+            is_async, true);
+    }
+
+    bool IsMapPending(GPUVAddr gpu_addr, u64 size) const {
+        return pending_maps.Overlaps(gpu_addr, size);
     }
 
     /// Notify rasterizer that any caches of the specified region should be flushed to Switch memory
@@ -353,7 +376,10 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
+    std::atomic<u64> present_ns{};
     u64 last_sync_fence{};
+
+    VideoCommon::PendingMaps pending_maps;
     std::mutex sync_request_mutex;
     std::condition_variable sync_request_cv;
 
@@ -567,8 +593,12 @@ void GPU::RunInOrder(std::function<void()>&& func) {
     impl->RunInOrder(std::move(func));
 }
 
-void GPU::MapInOrder(std::function<void()>&& func) {
-    impl->MapInOrder(std::move(func));
+void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
+    impl->MapInOrder(gpu_addr, size, std::move(func));
+}
+
+bool GPU::IsMapPending(GPUVAddr gpu_addr, u64 size) const {
+    return impl->IsMapPending(gpu_addr, size);
 }
 
 void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {

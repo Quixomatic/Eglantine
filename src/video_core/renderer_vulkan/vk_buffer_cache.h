@@ -117,6 +117,11 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
+    /// EDEN_NX2_FAST_DRAW: repacked vertex streams are rebuilt per draw, so no reuse.
+    bool AnyVertexRepacked() const {
+        return vertex_repack_mask != 0;
+    }
+
     u64 CurrentTick();
 
     bool IsFree(u64 tick);

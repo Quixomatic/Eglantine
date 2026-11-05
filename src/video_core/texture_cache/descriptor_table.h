@@ -77,8 +77,13 @@ public:
         ClearReadDescriptors();
         invalidated = false;
         //
-        descriptors.resize(num_descriptors);
-        bound_ids.resize(num_descriptors, Id{0});
+        // Grow only (Lichii ddeb895d5, from Eglantine #277): a smaller limit kept the storage, so
+        // alternating limits don't value-initialize it again. Clearing above invalidates the
+        // addressable range; entries past it are cleared when a later limit exposes them.
+        if (descriptors.size() < num_descriptors) {
+            descriptors.resize(num_descriptors);
+            bound_ids.resize(num_descriptors, Id{0});
+        }
     }
 
     std::vector<u64> read_descriptors;

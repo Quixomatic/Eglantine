@@ -7,6 +7,51 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.40] - 2026-11-05
+
+The rest of Lichii's performance work: its front-wait and back-record branches, more fixes on by
+default, and its fast draw and parallel recording experiments behind switches (off, as in Lichii).
+Ocarina of Time's forest sample reads 37.3 fps (1% low 31.6) against 36.7 (32.2) on 0.1.39, within
+noise; no rejected shaders, 0 flash frames of 140. Donkey Kong Bananza was not measured.
+
+### Changed
+- **Draw-written command list pages flush in one GPU round trip** (Lichii `407136901`,
+  `EDEN_NX2_CMDPAGE_BATCH=0`), and macro DMA reads of GPU-written pages wait only for the methods that
+  write memory (`7429fba04`, `EDEN_NX2_MACRO_DMA_DRAIN=1` drains fully again).
+- **Draw setup** (Lichii `perf/dkb-back-record`): `GetMemoryLayoutSize` reuses the last interval it
+  found, binding clean buffers skips words with nothing to do (`EDEN_NX2_EMPTY_WORD_SKIP=0`),
+  descriptor tables no longer shrink, and gathered buffers retire with their owners.
+- **Idle cores spin 100 us before blocking** on Switch 2 titles (Lichii #150; `EDEN_NX2_IDLE_SPIN_US`).
+- **Boost and Overclock scale Switch 2 GPU time** since the last present (Lichii #114,
+  `EDEN_NX2_AMPERE_GPU_CLOCK=0`).
+- The alpha test reference is rounded to 1/255 in pipeline keys (upstream #544 via Lichii #110,
+  `EDEN_NX2_ALPHA_REF_ROUND=0`); untouched buffers skip usage tracker resets.
+
+### Added
+- **Fast draw, off by default** (Lichii `perf/nx2-fast-draw`): `EDEN_NX2_FAST_DRAW=1` reuses unchanged
+  draws, `=2` adds delta draws; `EDEN_NX2_FAST_DRAW_VERIFY`, `EDEN_NX2_BUFFER_SKIP`,
+  `EDEN_NX2_INLINE_INVALIDATE`, `EDEN_NX2_DYNAMIC_SKIP`, `EDEN_NX2_DRAW_RUNS`. Reused draws still go
+  through our draw merging and the failed-pipeline check.
+- **Parallel recording, off by default** (Lichii `perf/gpu-parallel-record`):
+  `EDEN_NX2_PARALLEL_RECORD=1` records resolved graphics batches on secondary workers. Its
+  `EDEN_NX2_METHOD_FAST` part is not ported yet.
+- **OOT upscaler stand-in for Mesa's Intel driver** (Lichii #143), where tensor programs are no longer
+  emulated outside DLSS evaluations; NVIDIA is unchanged.
+
+### Fixed
+- Command list entries on memory a queued GPU map changes wait for the map (upstream #543, Pokopia);
+  `PaceToVblank` checks the presenting process (upstream #547, MKW); an out-of-date swapchain acquire
+  returns at once (#427).
+- The small-page `PageTableOp` updates the kind map under its lock.
+- RomFS falls back to the loaded one for program index 0 (Lichii #159); a failed ZBIC segment fails the
+  NSO load (#160).
+
+### Internal
+- Tests from Lichii's branches (range map, memory tracker, descriptor table, pending maps, GPU
+  timestamps, parallel recording); 268 pass, 1 needs `EDEN_TEST_VULKAN=1`.
+- Not taken: Lichii's run cache, written-SSBO mark cap and split rebalance (marked "not for nx2"
+  there), debug-only traces.
+
 ## [0.1.39] - 2026-11-05
 
 Lichii's performance work, hand ported on top of our own GPU optimizations: Ocarina of Time's forest

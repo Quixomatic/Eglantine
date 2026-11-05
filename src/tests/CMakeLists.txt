@@ -5,6 +5,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    video_core/host_gpu_profile.cpp
+    video_core/resolved_batch.cpp
+    video_core/parallel_recorder.cpp
+    video_core/parallel_recording_vulkan.cpp
+    video_core/parallel_recording_shaders.h
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -33,6 +38,7 @@ add_executable(tests
     video_core/vertex_repack.cpp
     video_core/ampere_lowering.cpp
     video_core/gpu_timestamp.cpp
+    video_core/pending_maps.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
     video_core/ampere_returns.cpp

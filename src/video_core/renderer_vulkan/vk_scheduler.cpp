@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -16,6 +17,7 @@
 
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
+#include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/nx2_profile.h"
 #include "common/settings.h"
@@ -24,6 +26,8 @@
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_parallel_recorder.h"
+#include "video_core/renderer_vulkan/vk_resolved_batch.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -32,8 +36,21 @@
 
 namespace Vulkan {
 
+namespace {
+// Lichii perf/gpu-parallel-record: EDEN_NX2_PARALLEL_RECORD=1 captures render passes as immutable
+// batches and records passes of two or more batches on secondary workers. Off when unset.
+bool ParallelRecordEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_PARALLEL_RECORD");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+} // Anonymous namespace
+
 void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
                                          vk::CommandBuffer upload_cmdbuf) {
+    const VideoCommon::HostGpuProfile::Scope profile{VideoCommon::HostGpuProfile::Phase::Worker};
     auto command = first;
     while (command != nullptr) {
         auto next = command->GetNext();
@@ -57,12 +74,47 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     multi_draw = device.IsExtMultiDrawSupported();
     multi_draw_indirect = device.IsMultiDrawIndirectSupported();
 
+    if (ParallelRecordEnabled()) {
+        resolved_recorder = std::make_unique<PassRecorder>(
+            [this](std::span<const ResolvedBatch> batches) {
+                if (!parallel_recorder) {
+                    parallel_recorder = std::make_unique<ParallelRecorder>(
+                        device.GetLogical(), device.GetDispatchLoader(), device.GetGraphicsFamily());
+                }
+                master_semaphore->Refresh();
+                auto recorded =
+                    parallel_recorder->RecordPass(batches, master_semaphore->KnownGpuTick());
+                if (!recorded) {
+                    resolved_recorder->NoteFallback(InlineFallbackReason::Budget);
+                    VideoCommon::HostGpuProfile::Add(
+                        VideoCommon::HostGpuProfile::Counter::BudgetFallbacks);
+                }
+                return recorded;
+            },
+            PassRecorder::Limits{.minimum_batches = 2, .retain_inline_state = false});
+        LOG_INFO(Render_Vulkan,
+                 "Parallel record experiment: immutable batches, secondary workers started on demand");
+    }
+    worker_submission_tick = master_semaphore->CurrentTick();
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
 }
 
-Scheduler::~Scheduler() = default;
+Scheduler::~Scheduler() {
+    if (resolved_recorder) {
+        // The secondary workers' pools must outlive their last submission.
+        WaitWorker();
+        worker_thread.request_stop();
+        worker_thread.join();
+        if (parallel_recorder) {
+            parallel_recorder->StopAndJoin();
+        }
+        if (last_worker_submitted_tick != 0) {
+            master_semaphore->Wait(last_worker_submitted_tick);
+        }
+    }
+}
 
 namespace {
 // Draws per batch (VK_EXT_multi_draw guarantees maxMultiDrawCount >= 1024).
@@ -328,6 +380,14 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
+    const VideoCommon::HostGpuProfile::Scope profile{VideoCommon::HostGpuProfile::Phase::Wait};
+    if (resolved_recorder) {
+        // An unfinished captured pass becomes inline here, so descriptor storage reuse never waits
+        // for an end-pass command the blocked producer hasn't sent.
+        Record([this](vk::CommandBuffer) {
+            resolved_recorder->MaterializeInline(InlineFallbackReason::Drain);
+        });
+    }
     DispatchWork(true);
 
     // Ensure the queue is drained.
@@ -372,6 +432,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
                                     const VkClearValue* clear_values, u32 clear_value_count) {
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
@@ -565,10 +626,14 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             std::unique_lock lk{queue_mutex};
 
             // Wait for work.
-            event_cv.wait(lk, stop_token, [&] {
-                worker_waiting = !TryPopQueue(work);
-                return !worker_waiting;
-            });
+            {
+                const VideoCommon::HostGpuProfile::Scope profile{
+                    VideoCommon::HostGpuProfile::Phase::Wait};
+                event_cv.wait(lk, stop_token, [&] {
+                    worker_waiting = !TryPopQueue(work);
+                    return !worker_waiting;
+                });
+            }
             worker_waiting = false;
 
             // If we've been asked to stop, we're done.
@@ -602,6 +667,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 }
 
 void Scheduler::AllocateWorkerCommandBuffer() {
+    const VideoCommon::HostGpuProfile::Scope profile{VideoCommon::HostGpuProfile::Phase::Pool};
     current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -616,6 +682,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
+    if (resolved_recorder) {
+        resolved_recorder->BeginSubmission(worker_submission_tick, current_cmdbuf);
+        current_cmdbuf = resolved_recorder->CommandBuffer();
+    }
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
@@ -634,6 +704,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         };
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
+        if (resolved_recorder) {
+            ASSERT(worker_submission_tick == signal_value);
+            resolved_recorder->EndSubmission();
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -658,6 +732,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             vk::Check(result);
             break;
         }
+        last_worker_submitted_tick = signal_value;
+        worker_submission_tick = signal_value + 1;
     });
     chunk->MarkSubmit();
     DispatchWork(true);
@@ -692,6 +768,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier_pending = false;
         render_pass_has_stores = false;
+        ++render_pass_serial;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

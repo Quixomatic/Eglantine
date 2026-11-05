@@ -112,6 +112,15 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    /// Switch 2, the split drained: flushes the command list pages `pages` (4 KiB, device
+    /// addresses) to guest memory, with every page draws wrote since it was last flushed, in one
+    /// GPU round trip (Lichii perf/dkb-front-waits).
+    virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+        for (const DAddr page : pages) {
+            FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
+        }
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
@@ -215,6 +224,11 @@ public:
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {
         return false;
+    }
+
+    /// Whether this host can emulate native tensor programs (matrix multiplies) in software.
+    [[nodiscard]] virtual bool EmulatesNativeTensorPrograms() const {
+        return true;
     }
 
     /// Whether NVIDIA DLSS (the "Use NVIDIA DLSS" setting) would draw a game's DLSS evaluation.

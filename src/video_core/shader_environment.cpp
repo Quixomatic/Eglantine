@@ -872,8 +872,10 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
         // it can be shown, else a replacement upscale draws its output. Other matrix multiplies
         // are emulated: DK Bananza's upscaler is no recognized evaluation, and rejecting its
         // passes leaves the whole scene purple.
+        // Mesa's Intel driver rejects them outside those cases (Lichii #143).
         native_tensor = kepler_compute->EmulatesNativeTensorPrograms() ||
-                        !kepler_compute->FollowsDlssEvaluation();
+                        (!kepler_compute->FollowsDlssEvaluation() &&
+                         kepler_compute->HostEmulatesNativeTensorPrograms());
         InitializeNativeCode(std::move(lowered_native_), 0, false, true);
         start_address = sizeof(sph);
     }

@@ -23,6 +23,7 @@
 #include "video_core/engines/engine_interface.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
@@ -172,6 +173,7 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    last_memory_write_position = 0;
     last_release_position = 0;
     sem_write_positions.fill(0);
     published_local = 0;
@@ -242,6 +244,12 @@ bool GpuSplit::WaitForSyncedWriters(Nx2Profile::DrainSite site) {
 
 bool GpuSplit::WaitForSync(Nx2Profile::DrainSite site) {
     return WaitFor(std::min(last_sync_position, write_position), site);
+}
+
+bool GpuSplit::WaitForMemoryWriters(Nx2Profile::DrainSite site) {
+    const u64 target =
+        std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    return WaitFor(std::min(target, write_position), site);
 }
 
 bool GpuSplit::WaitFor(u64 target, Nx2Profile::DrainSite site) {
@@ -327,6 +335,9 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         amount -= piece;
         methods_pending -= piece;
     }
+    if (engine->memory_write_mask[method]) {
+        last_memory_write_position = write_position;
+    }
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
@@ -349,6 +360,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
@@ -370,6 +384,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -382,6 +399,9 @@ size_t GpuSplit::Execute(const u64* entry) {
     case Kind::Run: {
         const size_t count = static_cast<size_t>((head >> 8) & 0xffffff);
         auto* const engine = back_engine;
+        if (!engine->reports_fast_draw_breaks) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
+        }
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         // Only Method entries feed the sink: one check covers the run.
         engine->ConsumeSink(*system);
@@ -389,6 +409,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         return 1 + count;
     }
     case Kind::Call: {
+        if ((head & FastDrawNeutral) == 0) {
+            Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;

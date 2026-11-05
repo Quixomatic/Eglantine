@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
+#include "video_core/host_gpu_profile.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
@@ -57,6 +58,10 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    // Split out of "update buffers" (Lichii cf1598616):
+    UpdateGeometryBuffers, ///< Index, vertex and transform feedback buffers looked up
+    UpdateStageBuffers,    ///< Uniform, storage and texture buffers looked up for each stage
+    BindGeometryBuffers,   ///< Index, vertex, transform feedback and indirect buffers bound
     Count,
 };
 
@@ -68,6 +73,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
     "fence skipped", "method", "split drain", "split wait",
+    "update geometry buffers", "update stage buffers", "bind geometry buffers",
 };
 
 // On from startup with EDEN_NX2_GPU_PROFILE; the MCP server can toggle it. Enabled() runs several
@@ -301,6 +307,8 @@ inline void Report(const char* thread_name = "GPU thread") {
         data = {};
         data.window_start = now;
         data.generation = generation;
+        HostGpuProfile::accounting.TakeSamples();
+        HostGpuProfile::TakeCounters();
         return;
     }
     const u64 window = now - data.window_start;
@@ -349,6 +357,24 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     if (!drains.empty()) {
         line += " | split drains/s by site: " + drains;
+    }
+    // Lichii perf/gpu-parallel-record: host recording/encoding/submission phases per thread.
+    const auto host_samples = HostGpuProfile::accounting.TakeSamples();
+    for (size_t i = 0; i < host_samples.size(); ++i) {
+        const auto& sample = host_samples[i];
+        if (sample.calls == 0 && sample.nanoseconds == 0) {
+            continue;
+        }
+        line += fmt::format(" | host {} {:.3f} ms ({:.0f}/s)", HostGpuProfile::names[i],
+                            static_cast<double>(sample.nanoseconds) * 1000.0 / window,
+                            static_cast<double>(sample.calls) * 1e9 / window);
+    }
+    const auto host_counters = HostGpuProfile::TakeCounters();
+    for (size_t i = 0; i < host_counters.size(); ++i) {
+        if (host_counters[i] != 0) {
+            line += fmt::format(" | host {} {:.0f}/s", HostGpuProfile::counter_names[i],
+                                static_cast<double>(host_counters[i]) * 1e9 / window);
+        }
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     {

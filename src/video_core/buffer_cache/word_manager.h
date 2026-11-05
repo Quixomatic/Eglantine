@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <utility>
@@ -196,6 +197,17 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            // Lichii 08762ff25: nothing to collect or clear in this word (untracked CPU pages
+            // still owe a tracking notification). EDEN_NX2_EMPTY_WORD_SKIP=0 walks every word.
+            static const bool skip_empty = [] {
+                const char* value = std::getenv("EDEN_NX2_EMPTY_WORD_SKIP");
+                return value == nullptr || value[0] != '0';
+            }();
+            if (skip_empty && word == 0 &&
+                (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
+                            (untracked_words[index] & mask) == 0))) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);

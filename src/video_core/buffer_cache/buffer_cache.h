@@ -21,6 +21,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
 
@@ -109,6 +110,24 @@ void BufferCache<P>::TickFrame() {
     }
     runtime.TickFrame(slot_buffers);
     native_indirect_uniforms_this_frame.clear();
+    if (Nx2FastDraw::g_buffer_skip) [[unlikely]] {
+        const u64 now = Nx2Profile::Now();
+        if (skip_stats.window_start == 0) {
+            skip_stats.window_start = now;
+        } else if (now - skip_stats.window_start >= 10'000'000'000ULL) {
+            const double seconds = static_cast<double>(now - skip_stats.window_start) / 1e9;
+            LOG_INFO(HW_GPU,
+                     "Buffer skip per second: {:.0f} of {:.0f} vertex lookups kept, {:.0f} of "
+                     "{:.0f} vertex uploads skipped, {:.0f} verify mismatches (total {})",
+                     static_cast<double>(skip_stats.lookups_kept) / seconds,
+                     static_cast<double>(skip_stats.lookups) / seconds,
+                     static_cast<double>(skip_stats.syncs_skipped) / seconds,
+                     static_cast<double>(skip_stats.syncs) / seconds,
+                     static_cast<double>(skip_stats.verify_mismatches) / seconds,
+                     skip_stats.verify_mismatches);
+            skip_stats = SkipStats{.window_start = now};
+        }
+    }
     if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
@@ -214,6 +233,16 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
+    // EDEN_NX2_FAST_DRAW=2: delta draws don't bind vertex buffers again.
+    if (Nx2FastDraw::g_delta_enabled && channel_state != nullptr) {
+        for (const Binding& binding : channel_state->vertex_buffers) {
+            if (device_addr < binding.device_addr + binding.size &&
+                binding.device_addr < device_addr + size) {
+                Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
+                break;
+            }
+        }
+    }
 }
 
 template <class P>
@@ -562,6 +591,78 @@ void BufferCache<P>::UpdateComputeBuffers() {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
     } while (channel_state->has_deleted_buffers);
+}
+
+template <class P>
+bool BufferCache<P>::RebindIndexBuffer() {
+    const size_t buffers = slot_buffers.size();
+    channel_state->has_deleted_buffers = false;
+    UpdateIndexBuffer();
+    if (channel_state->has_deleted_buffers || slot_buffers.size() != buffers) {
+        return false;
+    }
+    BindHostIndexBuffer();
+    return true;
+}
+
+template <class P>
+bool BufferCache<P>::RebindVertexBuffers() {
+    const size_t buffers = slot_buffers.size();
+    channel_state->has_deleted_buffers = false;
+    BufferOperations([&]() { UpdateVertexBuffers(); });
+    if (channel_state->has_deleted_buffers || slot_buffers.size() != buffers) {
+        return false;
+    }
+    BindHostVertexBuffers();
+    return true;
+}
+
+template <class P>
+bool BufferCache<P>::UpdateGraphicsStageBuffers() {
+    const size_t buffers = slot_buffers.size();
+    channel_state->has_deleted_buffers = false;
+    graphics_segments.clear();
+    BufferOperations([&]() {
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            UpdateUniformBuffers(stage);
+            UpdateStorageBuffers(stage);
+            UpdateTextureBuffers(stage);
+        }
+    });
+    return !channel_state->has_deleted_buffers && slot_buffers.size() == buffers;
+}
+
+template <class P>
+u64 BufferCache<P>::KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const {
+    u64 hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&](u64 value) { hash = (hash ^ value) * 0x100000001b3ULL; };
+    const auto mix_binding = [&](const auto& binding) {
+        mix(binding.device_addr);
+        mix(binding.size);
+    };
+    if (vertex) {
+        for (const Binding& binding : channel_state->vertex_buffers) {
+            mix_binding(binding);
+        }
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (storage) {
+            mix(channel_state->enabled_storage_buffers[stage]);
+            mix(channel_state->written_storage_buffers[stage]);
+            ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+                mix_binding(channel_state->storage_buffers[stage][index]);
+            });
+        }
+        if (texture) {
+            mix(channel_state->enabled_texture_buffers[stage]);
+            ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+                const TextureBufferBinding& binding = channel_state->texture_buffers[stage][index];
+                mix_binding(binding);
+                mix(static_cast<u64>(binding.format));
+            });
+        }
+    }
+    return hash;
 }
 
 template <class P>
@@ -1087,6 +1188,10 @@ void BufferCache<P>::UpdateVertexBufferSlot(u32 index, const Binding& binding) {
     if (slot.device_addr != binding.device_addr || slot.size != binding.size) {
         ++vertex_buffers_serial;
     }
+    if (slot.device_addr != binding.device_addr || slot.size != binding.size ||
+        slot.buffer_id != binding.buffer_id) {
+        memory_tracker.ForgetSynchronized(index);
+    }
     slot = binding;
     if (binding.buffer_id != NULL_BUFFER_ID && binding.size != 0) {
         enabled_vertex_buffers_mask |= (1u << index);
@@ -1161,8 +1266,25 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBufferMemo(vertex_sync_memo[index], binding.buffer_id, buffer,
-                                  binding.device_addr, binding.size);
+            if (!Nx2FastDraw::g_buffer_skip) {
+                SynchronizeBufferMemo(vertex_sync_memo[index], binding.buffer_id, buffer,
+                                      binding.device_addr, binding.size);
+            } else {
+                // Lichii perf/nx2-fast-draw EDEN_NX2_BUFFER_SKIP: ranges the tracker watched
+                // since their last scan, with no CPU write since, skip the scan.
+                ++skip_stats.syncs;
+                if (memory_tracker.IsSynchronized(index)) {
+                    ++skip_stats.syncs_skipped;
+                    if (Nx2FastDraw::g_verify &&
+                        !SynchronizeBuffer(buffer, binding.device_addr, binding.size)) {
+                        ++skip_stats.verify_mismatches;
+                    }
+                } else {
+                    SynchronizeBufferMemo(vertex_sync_memo[index], binding.buffer_id, buffer,
+                                          binding.device_addr, binding.size);
+                    memory_tracker.WatchSynchronized(index, binding.device_addr, binding.size);
+                }
+            }
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -1676,15 +1798,21 @@ template <class P>
 void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
     graphics_segments.clear();
     BufferOperations([&]() {
-        if (is_indexed) {
-            UpdateIndexBuffer();
+        {
+            Nx2Profile::Scope scope{Nx2Profile::Zone::UpdateGeometryBuffers};
+            if (is_indexed) {
+                UpdateIndexBuffer();
+            }
+            UpdateVertexBuffers();
+            UpdateTransformFeedbackBuffers();
         }
-        UpdateVertexBuffers();
-        UpdateTransformFeedbackBuffers();
-        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
-            UpdateUniformBuffers(stage);
-            UpdateStorageBuffers(stage);
-            UpdateTextureBuffers(stage);
+        {
+            Nx2Profile::Scope scope{Nx2Profile::Zone::UpdateStageBuffers};
+            for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                UpdateUniformBuffers(stage);
+                UpdateStorageBuffers(stage);
+                UpdateTextureBuffers(stage);
+            }
         }
         if (current_draw_indirect) {
             UpdateDrawIndirect();
@@ -1775,12 +1903,40 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
+    // EDEN_NX2_BUFFER_SKIP (Lichii perf/nx2-fast-draw): keep the last lookup while its address
+    // range, channel, page table and buffer set stay the same.
+    VertexLookup& lookup = vertex_lookups[index];
+    if (Nx2FastDraw::g_buffer_skip) {
+        const u64 map_serial = gpu_memory->MapSerial();
+        ++skip_stats.lookups;
+        const GPUVAddr lookup_begin = array.enable != 0 ? gpu_addr_begin : ~GPUVAddr{0};
+        if (lookup.valid && lookup.begin == lookup_begin && lookup.end == gpu_addr_end &&
+            lookup.owner == channel_state && lookup.map_serial == map_serial &&
+            lookup.deletions == buffer_deletions) {
+            ++skip_stats.lookups_kept;
+            channel_state->vertex_buffers[index] = lookup.binding;
+            UpdateVertexBufferSlot(index, lookup.binding);
+            return;
+        }
+        lookup = VertexLookup{
+            .begin = lookup_begin,
+            .end = gpu_addr_end,
+            .owner = channel_state,
+            .map_serial = map_serial,
+            .valid = false,
+        };
+    }
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     u32 size = address_size; // TODO: Analyze stride and number of vertices
     if (array.enable == 0 || size == 0 || !device_addr) {
         channel_state->vertex_buffers[index] = NULL_BINDING;
         UpdateVertexBufferSlot(index, NULL_BINDING);
+        if (Nx2FastDraw::g_buffer_skip) {
+            lookup.deletions = buffer_deletions;
+            lookup.binding = NULL_BINDING;
+            lookup.valid = true;
+        }
         return;
     }
     if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
@@ -1794,6 +1950,11 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     };
     channel_state->vertex_buffers[index] = binding;
     UpdateVertexBufferSlot(index, binding);
+    if (Nx2FastDraw::g_buffer_skip) {
+        lookup.deletions = buffer_deletions;
+        lookup.binding = binding;
+        lookup.valid = true;
+    }
 }
 
 template <class P>
@@ -2117,6 +2278,37 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
         std::scoped_lock lock{nx2_list_mutex};
         Nx2ListPage& entry = nx2_list_pages[page];
         entry.synced_writes = entry.writes;
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
+    std::vector<std::pair<DAddr, u64>> ranges;
+    for (const DAddr page : pages) {
+        ranges.emplace_back(page, page_size);
+    }
+    std::vector<std::pair<DAddr, u64>> drawn;
+    if constexpr (!IS_OPENGL) {
+        std::scoped_lock lock{nx2_list_mutex};
+        for (const auto& [page, entry] : nx2_list_pages) {
+            if (entry.draw_written && entry.synced_writes != entry.writes) {
+                ranges.emplace_back(page, page_size);
+                drawn.emplace_back(page, entry.writes);
+            }
+        }
+    }
+    // Lichii's DownloadMemoryRanges; ours (from #147) is the same without host-mapped buffers,
+    // which this buffer cache doesn't have.
+    DownloadRangesMemory(ranges);
+    if constexpr (!IS_OPENGL) {
+        std::scoped_lock lock{nx2_list_mutex};
+        for (const auto& [page, writes] : drawn) {
+            Nx2ListPage& entry = nx2_list_pages[page];
+            if (entry.writes == writes) {
+                entry.synced_writes = writes;
+            }
+        }
     }
 }
 
@@ -2738,6 +2930,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    ++buffer_deletions;
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
