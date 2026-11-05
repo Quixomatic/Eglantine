@@ -7,6 +7,22 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.36] - 2026-11-05
+
+Switch 2 query report timestamps are in nanoseconds, the unit of the other clocks these games read
+(Lichii #84, which took Star Fox from about 31 to 60 fps). Ocarina of Time's open area is unchanged on
+average: 39.3 fps against 39.6 with it off, 1% low 28.1 against 30.7 (one run each).
+
+### Fixed
+- **`GPU::GetTicks` returned scaled GPU ticks to Switch 2 titles** (`gpu_timestamp.h`). Switch 1 titles
+  keep their ticks and the Boost and Overclock scaling. On Switch 2 titles, Boost and Overclock no longer
+  make GPU durations look shorter. `EDEN_NX2_NS_TIMESTAMPS=0` returns to the ticks.
+
+### Internal
+- `.plans/dk-perf-scripts/measure_oot.sh`: boots OOT, runs its `to_gameplay` route and takes a 20 s
+  sample with a GPU profile and a screenshot.
+- Tests from Lichii's `gpu_timestamp` cases (207 pass, run before the switch was added).
+
 ## [0.1.35] - 2026-11-05
 
 More of Lichii's Ocarina of Time fixes, hand ported. Tested in the game: it looks better and a session
