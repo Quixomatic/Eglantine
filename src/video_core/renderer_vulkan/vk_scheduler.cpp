@@ -81,8 +81,11 @@ void Scheduler::RecordDraw(bool mergeable, u32 vertex_count, u32 instance_count,
     }
     FlushPendingDraws();
     if (!merge_draws || !mergeable) {
-        Record([vertex_count, instance_count, first_vertex,
+        Record([this, vertex_count, instance_count, first_vertex,
                 first_instance](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             cmdbuf.Draw(vertex_count, instance_count, first_vertex, first_instance);
         });
         return;
@@ -106,8 +109,11 @@ void Scheduler::RecordDrawIndexed(bool mergeable, u32 index_count, u32 instance_
     }
     FlushPendingDraws();
     if (!merge_draws || !mergeable) {
-        Record([index_count, instance_count, first_index, vertex_offset,
+        Record([this, index_count, instance_count, first_index, vertex_offset,
                 first_instance](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             cmdbuf.DrawIndexed(index_count, instance_count, first_index, vertex_offset,
                                first_instance);
         });
@@ -134,7 +140,10 @@ void Scheduler::RecordDrawIndirect(bool mergeable, bool indexed, VkBuffer buffer
     }
     FlushPendingDraws();
     if (!merge_draws || !mergeable || !multi_draw_indirect) {
-        Record([indexed, buffer, offset, stride](vk::CommandBuffer cmdbuf) {
+        Record([this, indexed, buffer, offset, stride](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             if (indexed) {
                 cmdbuf.DrawIndexedIndirect(buffer, offset, 1, stride);
             } else {
@@ -161,17 +170,23 @@ void Scheduler::FlushPendingDraws() {
             // The usual case: a plain draw, no allocation.
             const VkMultiDrawInfoEXT draw{pending.draws.front()};
             pending.draws.clear();
-            Record([draw, instances = pending.instance_count,
+            Record([this, draw, instances = pending.instance_count,
                     first_instance = pending.first_instance](vk::CommandBuffer cmdbuf) {
+                if (GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.Draw(draw.vertexCount, instances, draw.firstVertex, first_instance);
             });
             return;
         }
         std::vector<VkMultiDrawInfoEXT> draws(pending.draws.begin(), pending.draws.end());
         pending.draws.clear();
-        Record([draws = std::move(draws), instances = pending.instance_count,
+        Record([this, draws = std::move(draws), instances = pending.instance_count,
                 first_instance = pending.first_instance,
                 multi = multi_draw](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             if (draws.size() > 1 && multi) {
                 cmdbuf.DrawMultiEXT(draws, instances, first_instance);
                 return;
@@ -186,8 +201,11 @@ void Scheduler::FlushPendingDraws() {
         if (pending.indexed_draws.size() == 1) {
             const VkMultiDrawIndexedInfoEXT draw{pending.indexed_draws.front()};
             pending.indexed_draws.clear();
-            Record([draw, instances = pending.instance_count,
+            Record([this, draw, instances = pending.instance_count,
                     first_instance = pending.first_instance](vk::CommandBuffer cmdbuf) {
+                if (GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawIndexed(draw.indexCount, instances, draw.firstIndex, draw.vertexOffset,
                                    first_instance);
             });
@@ -196,9 +214,12 @@ void Scheduler::FlushPendingDraws() {
         std::vector<VkMultiDrawIndexedInfoEXT> draws(pending.indexed_draws.begin(),
                                                      pending.indexed_draws.end());
         pending.indexed_draws.clear();
-        Record([draws = std::move(draws), instances = pending.instance_count,
+        Record([this, draws = std::move(draws), instances = pending.instance_count,
                 first_instance = pending.first_instance,
                 multi = multi_draw](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             if (draws.size() > 1 && multi) {
                 cmdbuf.DrawMultiIndexedEXT(draws, instances, first_instance);
                 return;
@@ -212,9 +233,12 @@ void Scheduler::FlushPendingDraws() {
     }
     case PendingDraws::Kind::Indirect:
     case PendingDraws::Kind::IndirectIndexed:
-        Record([indexed = kind == PendingDraws::Kind::IndirectIndexed, buffer = pending.buffer,
-                offset = pending.offset, count = pending.indirect_count,
+        Record([this, indexed = kind == PendingDraws::Kind::IndirectIndexed,
+                buffer = pending.buffer, offset = pending.offset, count = pending.indirect_count,
                 stride = pending.stride](vk::CommandBuffer cmdbuf) {
+            if (GraphicsPipelineMissing()) {
+                return;
+            }
             if (indexed) {
                 cmdbuf.DrawIndexedIndirect(buffer, offset, count, stride);
             } else {
@@ -245,7 +269,8 @@ bool Scheduler::DeferFlush() {
     // for about 5%.
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
-        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
+        // 5000 (was 500, Lichii #161): list copies now submit on their own.
+        return value == nullptr ? s64{5000} : static_cast<s64>(std::atoll(value));
     }();
     if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
         std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
@@ -644,6 +669,7 @@ void Scheduler::AllocateNewContext() {
 }
 
 void Scheduler::InvalidateState() {
+    ++recording_epoch;
     state.graphics_pipeline = nullptr;
     state.rescaling_defined = false;
     state.descriptor_buffer_bound = false;
@@ -663,6 +689,9 @@ void Scheduler::EndRenderPass()
         if (!state.renderpass) {
             return;
         }
+        ++recording_epoch;
+        fragment_barrier_pending = false;
+        render_pass_has_stores = false;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

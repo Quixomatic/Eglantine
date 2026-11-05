@@ -303,6 +303,13 @@ GraphicsPipeline::GraphicsPipeline(
     for (const Shader::Info& info : stage_infos) {
         reads_draw_index |= info.loads[Shader::IR::Attribute::DrawID];
     }
+    const auto any_written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
+    };
+    writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+        return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
+               any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
 
     // Bindless textures: the same decision the pipeline cache made when it emitted the shaders.
     TextureHeap* const heap{texture_cache.GetRuntime().texture_heap.get()};
@@ -960,8 +967,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
         texture_cache.UpdateRenderTargets(false);
-        texture_cache.CheckFeedbackLoop(
-            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
+        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.TakeFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
     }
     if (IsBuilt() && !pipeline) {
         return false;
@@ -1039,6 +1050,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
 
     scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (writes_storage) {
+        scheduler.NoteRenderPassStores();
+    }
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
@@ -1106,6 +1120,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             cmdbuf.BindDescriptorBuffersEXT(binding_info);
         }
         if (bind_pipeline) {
+            scheduler.SetGraphicsPipelineMissing(!pipeline);
             if (!pipeline) {
                 return;
             }

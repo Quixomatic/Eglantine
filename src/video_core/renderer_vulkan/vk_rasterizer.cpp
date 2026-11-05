@@ -806,13 +806,36 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // A direct draw with no vertices, or no instances outside task/mesh pipelines, records
+    // nothing (Lichii perf/dkb-back-record 1aae8cdf1a, ~5% of DK's draws). Skip it before the
+    // pipeline, buffer and descriptor work: dirty state, deferred clears and query counter toggles
+    // stay pending for the next recorded draw, clear or render pass end, which apply them before
+    // anything can observe them. With transform feedback on the draw goes through.
+    // EDEN_NX2_SKIP_EMPTY_DRAWS=0 prepares them as before.
+    static const bool skip_empty = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_EMPTY_DRAWS");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_empty && maxwell3d->regs.transform_feedback_enabled == 0 &&
+        (MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                 .num_vertices == 0 ||
+         (instance_count == 0 && [this] {
+             const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+             return pipeline != nullptr && !pipeline->IsMeshPipeline();
+         }()))) {
+        gpu.TickWork();
+        return;
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
         if (mesh_draw) {
-            scheduler.Record([groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+            scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
             });
             return;
@@ -874,8 +897,11 @@ void RasterizerVulkan::DrawIndirect() {
             last_end = offset + (params.stride != 0 ? params.stride : params.buffer_size);
         }
         if (params.is_byte_count) {
-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
+            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
                                                 static_cast<u32>(stride));
             });
@@ -885,9 +911,12 @@ void RasterizerVulkan::DrawIndirect() {
             const auto count = buffer_cache.GetDrawIndirectCount();
             const auto& draw_buffer = count.first;
             const auto& offset_base = count.second;
-            scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
+            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirectCount(
                         buffer_obj, offset, draw_buffer_obj, offset_base,
@@ -910,8 +939,11 @@ void RasterizerVulkan::DrawIndirect() {
                                              stride % 4 == 0,
                                          params.is_indexed, buffer->Handle(), offset, stride);
         } else {
-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
+            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               params](vk::CommandBuffer cmdbuf) {
+                if (scheduler.GraphicsPipelineMissing()) {
+                    return;
+                }
                 if (params.is_indexed) {
                     cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
                                                static_cast<u32>(params.max_draw_counts),
@@ -1289,7 +1321,9 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    // Submitted at once (Lichii #161): the front waits for these copies in
+    // ReadGpuWrittenCommands, so they must not sit in a deferred batch.
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
 }
@@ -1373,6 +1407,14 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         .preemtive = true,
     };
     return new_area;
+}
+
+void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.ClearDownload(addr, size);
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
@@ -1614,7 +1656,16 @@ void RasterizerVulkan::Nx2Membar() {
 }
 
 void RasterizerVulkan::FragmentBarrier() {
-    // We already put barriers when a render pass finishes
+    // Lichii #161: end the render pass (which puts the barrier) only when the next draw needs it.
+    // OOT broke ~5,900 render passes a second here. EDEN_NX2_DEFER_FRAGMENT_BARRIER=0 ends it now.
+    static const bool defer = [] {
+        const char* value = std::getenv("EDEN_NX2_DEFER_FRAGMENT_BARRIER");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (defer) {
+        scheduler.DeferFragmentBarrier();
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -1826,11 +1877,12 @@ void RasterizerVulkan::FlushWork() {
         return;
     }
     // Keep the host GPU working while native commands are still being recorded.
-    static const u32 native_flush_draws = [] {
+    static const u32 native_flush_draws = [this] {
         // 512 (was 128): DK Bananza makes ~150k draws a second, and each submission cost ~55 us of
         // the GPU back thread; 512 measured 22.0 fps / 1% low 19.9 vs 21.4 / 16.3 on its open
-        // map, the same as 1024.
-        constexpr u32 fallback = 512;
+        // map, the same as 1024. 4096 outside MoltenVK (Lichii #161: OOT submitted ~960 command
+        // buffers a second at 128).
+        const u32 fallback = device.IsMoltenVK() ? 512 : 4096;
         const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
         if (value == nullptr || value[0] < '0' || value[0] > '9') {
             return fallback;

@@ -240,6 +240,9 @@ public:
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
 
+    /// True when one of these views is an image bound as a current render target.
+    [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
+
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
 
@@ -580,6 +583,9 @@ private:
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;
 
     bool has_deleted_images = false;
+    /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
+    /// skip the upload of a new target the clear overwrites whole.
+    bool clearing_render_targets = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;

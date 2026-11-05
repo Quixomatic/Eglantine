@@ -87,6 +87,8 @@ private:
     std::array<std::list<RegisteredAction>, NUM_MAX_SYNCPOINTS> host_action_storage;
 
     std::mutex guard;
+    /// Registered actions plus threads in Wait: Increment skips the lock while there are none.
+    std::atomic<u64> pending_waiters{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

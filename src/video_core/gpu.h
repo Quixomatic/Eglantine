@@ -16,6 +16,9 @@
 #include "video_core/framebuffer_config.h"
 #include "video_core/rasterizer_download_area.h"
 
+namespace Common {
+class Event;
+}
 namespace Core {
 class System;
 } // namespace Core
@@ -219,6 +222,12 @@ public:
 
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
+    /// The GPU thread has only channels suspended on semaphores left (Lichii #161).
+    [[nodiscard]] bool IsIdleOnPendingSemaphore() const;
+    /// `event` is set when the GPU thread goes idle on suspended channels.
+    void SetPendingIdleWake(const std::shared_ptr<Common::Event>& event);
+    /// Wakes the GPU thread to check its suspended channels again.
+    void WakePendingChannels();
 
     [[nodiscard]] bool UseNvdec() const;
 

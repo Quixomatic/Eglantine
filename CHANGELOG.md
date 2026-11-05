@@ -7,6 +7,68 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.39] - 2026-11-05
+
+Lichii's performance work, hand ported on top of our own GPU optimizations: Ocarina of Time's forest
+sample reads 36.7 fps (1% low 32.2) against 23.1 (20.7) on 0.1.38, with no rejected shaders and no
+white flashes (0 of 140 captured frames). Default settings; Donkey Kong Bananza was not measured.
+Every behaviour change has an `EDEN_NX2_*` off switch.
+
+### Changed
+- **Fewer submissions and render passes** (Lichii #161). Fragment barriers end the render pass only
+  when the next draw samples a render target or the pass wrote storage
+  (`EDEN_NX2_DEFER_FRAGMENT_BARRIER=0`). Switch 2 titles submit every 4096 draws outside MoltenVK
+  (`EDEN_NX2_FLUSH_DRAWS` still overrides), deferred flushes wait up to 5 ms, and command list copies
+  submit at once.
+- **The GPU split's front sleeps instead of spinning** while it waits for the back
+  (`EDEN_NX2_SPLIT_FRONT_SLEEP=0`); the back spins 512 times before idling (`EDEN_NX2_SPLIT_BACK_SPIN`).
+- **Semaphore acquires that are already met don't drain the back** (`EDEN_NX2_ACQUIRE_FAST=0`).
+  Command list and macro DMA reads wait only for the writers before the last host sync
+  (`EDEN_NX2_SYNCED_WRITERS=0`, `EDEN_NX2_DMA_READ_WAIT=0`), and only executable compute and DMA methods
+  count as writers (`EDEN_NX2_EXEC_WRITERS=0`).
+- **Constant buffer data writes are batched on the front** (`EDEN_NX2_CB_BATCH=0`), and executable 3D
+  methods rewritten with the same value no longer set dirty flags (`EDEN_NX2_SKIP_SAME_EXEC=0`).
+- **The GPU thread wakes as soon as a suspended channel can run**, polls 2 ms before sleeping, and
+  `WaitForFrame` stops waiting once it is idle on pending channels (`EDEN_NX2_PENDING_WAKE=0`). OOT
+  presents one frame ahead (`EDEN_NX2_FRAMES_AHEAD` overrides). Syncpoint increments skip the lock when
+  nothing waits.
+- **Guest CPU timing** (Lichii #161): invariant TSCs without a reported frequency are measured, the
+  wall clock is anchored at launch, `CNTPCT_EL0` is read inline (`EDEN_NX2_INLINE_CNTPCT=0`; native
+  clock, CPU clock Normal, sync core speed off), ordered loads are plain moves and `DMB` LD/ST is
+  skipped on x64, HostTiming runs at Critical priority. Unsafe CPU accuracy uses host FMA.
+- **Buffers without CPU writes skip the upload scan**, and an unchanged index buffer is not bound
+  again (`EDEN_NX2_INDEX_BIND_SKIP=0`) (Lichii #161).
+- **CPU writes onto GPU-written pages are uploaded into the buffer** instead of downloading the page
+  first (Lichii #103, `EDEN_NX2_INLINE_PAGE_WRITES=0/1`).
+- **A new render target a clear overwrites whole is not uploaded first** (Lichii #141).
+- **Empty direct draws are skipped** (Lichii `1aae8cdf1a`, `EDEN_NX2_SKIP_EMPTY_DRAWS=0`).
+- Video: the AV1 decoder `av1` (dav1d) is preferred, frames are reused, and a hardware decoder that
+  fails to open falls back to 4 CPU threads (Lichii #161).
+- Pipelines: used pipelines are kept for 16 sessions and saved every 15 s; `EDEN_NX2_PIPELINE_WORKERS`
+  sets the build worker count (Lichii #161).
+
+### Fixed
+- **Split deadlock**: a fence wait submits deferred work first (Lichii #149, OOT entering gameplay).
+- RED and SURED data registers are shadowed (Lichii #149); FSR3 frame generation interpolates
+  between the previous and current frame (Lichii #149).
+- **The remaining OOT compute forms** (Lichii #144, #125): indexed `ULDC` of 8 and 16 bits with any
+  offset (our 4 rejected programs), any UPn carry for `ULEA` and `UIADD3`, `F2IP.U8.F32`, P2R in the
+  call proof. 32-bit global `ATOM.CAS` (Lichii #140).
+- Draws after a graphics pipeline that failed to build are dropped (Lichii #142), the AMD demote
+  reorder counts nested returns (#127), the dirty memory gather is serialized (#138), ReinterpretImage
+  copies one depth aspect (#89), swapchain recreation waits for the device (#88).
+- `Common::Event::WaitFor` waits until its deadline after early MWAITX and UMWAIT wakes (Lichii #120,
+  #137) and wakes on `Set` on CPUs with neither (#161).
+- XCI Switch 2 titles get the Switch 2 clock (Lichii #119). NUP program ids are known before the GPU
+  and the JIT are created, and per-game values survive a config reload (#161).
+
+### Not taken
+- #161's forced OOT settings (accuracy, vsync, reactive flushing, DLSS, CPU clock): set per game by
+  the user.
+
+### Internal
+- Tests: Lichii's Event tests and new lowering tests for the #144 forms; all 226 cases pass.
+
 ## [0.1.38] - 2026-11-05
 
 Ocarina of Time's foliage no longer flashes white while the camera moves, at Low GPU accuracy with the

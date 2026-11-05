@@ -31,6 +31,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -517,7 +518,19 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
         }
         return;
     }
-    ProcessDirtyRegisters(method, argument);
+    // Lichii #161: an executable method written with the value it holds still runs, but marks
+    // nothing dirty. EDEN_NX2_SKIP_SAME_EXEC=0 marks it dirty as before.
+    static const bool skip_same_exec = [] {
+        const char* value = std::getenv("EDEN_NX2_SKIP_SAME_EXEC");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (skip_same_exec && SkipSameValueWrites() && regs.reg_array[method] == argument) {
+        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+            draw_manager.DrawDeferred(*this, true);
+        }
+    } else {
+        ProcessDirtyRegisters(method, argument);
+    }
     ProcessMethodCall(method, argument, method_argument, is_last_call);
 }
 
@@ -890,6 +903,8 @@ struct Maxwell3D::FrontState {
     Regs::ShadowRamControl control{};
     u32 executing_macro{};
     std::vector<u32> parameters;
+    /// Constant buffer data words a front macro wrote, sent as one MultiMethod (Lichii #161).
+    std::vector<u32> cb_words;
     u64 calls{};
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
@@ -1049,6 +1064,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        // A release the puller's acquire fast path waits for (GpuSplit::WaitForSemaphore).
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1154,6 +1175,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        split.NoteSemaphoreWrite(
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1208,6 +1234,22 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             LOG_INFO(HW_GPU, "macro trace {:#x} (code {:#x}): params {:08x}", method, start,
                      fmt::join(fs.parameters, " "));
         }
+        // Lichii #161: consecutive constant buffer data writes of a macro go to the back as one
+        // MultiMethod (one CallMultiMethod there) instead of one write each.
+        // EDEN_NX2_CB_BATCH=0 sends them one by one.
+        static const bool cb_batch = [] {
+            const char* value = std::getenv("EDEN_NX2_CB_BATCH");
+            return value == nullptr || value[0] != '0';
+        }();
+        constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        const auto flush_cb = [&] {
+            if (!fs.cb_words.empty()) {
+                split.MultiMethod(this, cb_data, fs.cb_words.data(),
+                                  static_cast<u32>(fs.cb_words.size()),
+                                  static_cast<u32>(fs.cb_words.size()), nullptr);
+                fs.cb_words.clear();
+            }
+        };
         const auto result = engine.native_jit->Execute(
             start, fs.parameters, std::span<u32>{native_data_ram},
             [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
@@ -1218,6 +1260,14 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 if (address >= MacroRegistersStart) {
                     return false;
                 }
+                if (cb_batch && address >= cb_data && address < cb_data + 16 &&
+                    fs.control != Regs::ShadowRamControl::Replay) {
+                    // As the back's CallMultiMethod: the data goes to the buffer, the offset moves.
+                    fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
+                    fs.cb_words.push_back(value);
+                    return true;
+                }
+                flush_cb();
                 FrontWrite(split, fs, address, value, true, true);
                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
                 if (address == 0x157 || address == 0x158) {
@@ -1225,6 +1275,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                 }
                 return true;
             });
+        flush_cb();
         if (trace) {
             LOG_INFO(HW_GPU, "macro trace {:#x} writes:{}", method, trace_writes);
         }
@@ -1370,16 +1421,39 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
                              u32 count) {
     // The words may be written by methods still queued for the back (indirect draw arguments
     // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    split.Drain(VideoCommon::Nx2Profile::DrainSite::FrontDmaRead);
+    // Lichii #161: wait only for the writers before the last host-level wait and the last
+    // release at that address, and drain fully only for GPU-written pages (OOT's top drain).
+    // EDEN_NX2_DMA_READ_WAIT=0 always drains.
+    static const bool partial_wait = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_WAIT");
+        return value == nullptr || value[0] != '0';
+    }();
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
     const size_t read_bytes = size_t{words} * sizeof(u32);
+    bool gpu_written = true;
+    if (partial_wait) {
+        split.WaitForSyncedWriters(VideoCommon::Nx2Profile::DrainSite::FrontDmaRead);
+        split.WaitForSemaphore(source, VideoCommon::Nx2Profile::DrainSite::FrontDmaRead);
+        gpu_written = false;
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            if (device && Tegra::Nx2IsGpuWritten(*device)) {
+                gpu_written = true;
+                break;
+            }
+        }
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+    if (gpu_written) {
+        split.Drain(VideoCommon::Nx2Profile::DrainSite::FrontDmaRead);
+        if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+            memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        }
     }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));

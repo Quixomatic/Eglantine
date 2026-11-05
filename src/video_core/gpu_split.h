@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -150,9 +151,44 @@ public:
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::WriterWait);
+    /// As WaitForWriters, but only for the writers sent before the last host-level wait
+    /// (NoteSync): the guest can't expect later ones to be done (Lichii #161).
+    /// EDEN_NX2_SYNCED_WRITERS=0 waits for all writers, as WaitForWriters.
+    bool WaitForSyncedWriters(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::WriterWait);
+    /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
+    /// bit, a semaphore acquire): the guest's GPU work before it is complete before the
+    /// commands after it are fetched.
+    void NoteSync() {
+        last_sync_position = write_position;
+    }
+    /// Waits until the back executed the work sent before the last NoteSync.
+    bool WaitForSync(Nx2Profile::DrainSite site = Nx2Profile::DrainSite::CommandSync);
+
+    /// Semaphore releases sent to the back, by address hash (Lichii #161): an acquire whose value
+    /// is already met needs the back only up to the last release that may have written it.
+    static constexpr size_t SemSlot(u64 addr) noexcept {
+        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10) ^ (addr >> 18)) & 63U);
+    }
+    void NoteSemaphoreWrite(u64 addr) noexcept {
+        sem_write_positions[SemSlot(addr)] = write_position;
+        last_release_position = write_position;
+    }
+    /// Work that may release semaphores at addresses the front doesn't see (compute, copies).
+    void NoteAnyRelease() noexcept {
+        last_release_position = write_position;
+    }
+    [[nodiscard]] u64 LastReleasePosition() const noexcept {
+        return last_release_position;
+    }
+    bool WaitForSemaphore(u64 addr, Nx2Profile::DrainSite site = Nx2Profile::DrainSite::Puller) {
+        return WaitFor(sem_write_positions[SemSlot(addr)], site);
+    }
 
 private:
+    /// Waits until the back consumed `target`. Returns whether it had not yet.
+    bool WaitFor(u64 target, Nx2Profile::DrainSite site);
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -215,6 +251,9 @@ private:
     // Front side.
     alignas(128) u64 write_position{};
     u64 last_writer_position{};
+    u64 last_sync_position{};
+    u64 last_release_position{};
+    std::array<u64, 64> sem_write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -241,6 +280,9 @@ private:
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
     std::jthread back_thread;
+    /// The front sleeps on front_wake in WaitFor; the back bumps it once past wait_target.
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
 };
 
 } // namespace VideoCommon

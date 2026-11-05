@@ -363,4 +363,81 @@ TEST_CASE("Ampere ISBEWR shadows a high data register", "[video_core][ampere]") 
     REQUIRE(pressure.valid);
     CHECK(pressure.instruction.Bits(32, 8) < 216);
 }
+
+// Lichii #144's encodings (from its ampere_fast_fusion_logged tests).
+TEST_CASE("Ocarina indexed uniform constant loads keep their U8 and U16 widths",
+          "[video_core][ampere][oot]") {
+    struct Case {
+        Instruction instruction;
+        u64 target, index, offset, bank, width;
+    };
+    // ULDC UR, c[bank][UR + offset] from Ocarina of Time's compute programs.
+    const std::array cases{
+        Case{{{0x11047abb, 0x01400000, 0x08000400, 0x000fe400}}, 220, 233, 0x00, 5, 2},
+        Case{{{0x06077abb, 0x01002080, 0x08000000, 0x000fe400}}, 223, 222, 0x82, 4, 0},
+        Case{{{0x0d047abb, 0x014000c0, 0x08000000, 0x000fe400}}, 220, 229, 0x03, 5, 0},
+        Case{{{0x06087abb, 0x01002080, 0x08000000, 0x000fe400}}, 224, 222, 0x82, 4, 0},
+    };
+    for (const Case& test : cases) {
+        CAPTURE(test.instruction.words[0]);
+        const auto lowered = LowerToMaxwell(std::array{test.instruction, EXIT});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+              (0xef90000000070000ULL | test.target | (test.index << 8) | (test.offset << 20) |
+               (test.bank << 36) | (test.width << 48)));
+    }
+    // An indexed load can have any immediate: the register can align it (ULDC.32 at UR15 + 0x29).
+    const Instruction indexed_word{{0x0f077abb, 0x01000a40, 0x08000800, 0x000fc600}};
+    const auto word = LowerToMaxwell(std::array{indexed_word, EXIT});
+    INFO(word.error);
+    REQUIRE(word);
+    CHECK(word.instructions[word.source_instruction_offsets[0]] ==
+          (0xef90000000070000ULL | 223 | (u64{231} << 8) | (u64{0x29} << 20) | (u64{4} << 36) |
+           (u64{4} << 48)));
+    // A direct U16 load needs an even offset, and a direct subword load the short offset range.
+    const Instruction misaligned{{0x00077ab9, 0x01000040, 0x00000400, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{misaligned, EXIT}));
+    const Instruction far{{0x00077ab9, 0x01200000, 0x00000000, 0x000fe400}};
+    CHECK_FALSE(LowerToMaxwell(std::array{far, EXIT}));
+}
+
+TEST_CASE("Ocarina I2F from a uniform register selects any byte", "[video_core][ampere][oot]") {
+    // I2F.F32.U8 R9, UR17.B3
+    const Instruction convert{{0x00097d06, 0x30000011, 0x08001000, 0x000fe200}};
+    const auto lowered = LowerToMaxwell(std::array{convert, EXIT});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(lowered.instructions[lowered.source_instruction_offsets[0]] ==
+          (0x5cb8000000070000ULL | 9 | (u64{2} << 8) | (u64{233} << 20) | (u64{3} << 41)));
+}
+
+TEST_CASE("Ocarina F2IP with two sources and default rounding lowers", "[video_core][ampere][oot]") {
+    // F2IP.U8.F32 R41, R40, R39, RZ
+    const Instruction convert{{0x28297243, 0x27, 0x000004ff, 0x000fc400}};
+    const auto lowered = LowerToMaxwell(std::array{convert, EXIT});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    auto modified = convert;
+    modified.words[2] = 0x000044ff;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, EXIT}));
+    modified = convert;
+    modified.words[2] = 0x00000406;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, EXIT}));
+}
+
+TEST_CASE("Ocarina uniform adds and LEAs carry through any UP", "[video_core][ampere][oot]") {
+    // UIADD3 UR12, UR12, 0x10 and ULEA UR10, UR6, UR10, 2 with the carry out in UPn.
+    constexpr Instruction add{{0x0c0c7890, 0x00000010, 0x0ff9e03f, 0x000fc400}};
+    constexpr Instruction lea{{0x060a7291, 0x0000000a, 0x0f84103f, 0x000fe200}};
+    for (u32 up = 0; up < 7; ++up) {
+        CAPTURE(up);
+        for (Instruction instruction : {add, lea}) {
+            instruction.words[2] = (instruction.words[2] & ~(7U << 17)) | (up << 17);
+            const auto lowered = LowerToMaxwell(std::array{instruction, EXIT});
+            INFO(lowered.error);
+            CHECK(lowered);
+        }
+    }
+}
 } // namespace
