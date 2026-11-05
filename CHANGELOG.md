@@ -7,6 +7,55 @@ Versions follow [Semantic Versioning](https://semver.org) (`X.Y.Z`, three segmen
 written by the `/version-bump` skill and used as its commit message body. A `vX.Y.Z` tag on the `release`
 branch builds every platform and publishes a GitHub Release (see `.github/workflows/release-binaries.yml`).
 
+## [0.1.34] - 2026-11-05
+
+Ocarina of Time reaches gameplay with its scene and minimap showing, instead of a black screen with
+only the HUD, and no longer crashes after its first cutscene. Its bloom and fog are still wrong. The
+bloom work is from Lichii's PR #87 as it stood before it was finished, and newer Lichii fixes are
+still to come. Donkey Kong Bananza was not measured on this version.
+
+### Fixed
+- **Shader reuse hid native programs from translation** (`vk_shader_reuse`). `RecordingEnvironment`
+  did not forward `IsNativeProgram()` or `IsCbufStorageBufferPointer()` and did not copy the mesh
+  registers, so with reuse on, native programs were translated as non-native with zeroed mesh
+  registers: register shadow copies were dropped, storage buffers failed to track, and every mesh
+  pipeline failed with `Mesh output topology 0`. This affected other native games too.
+- **Crash from preparing the null image view** (`PrepareImageView`, present since 0.1.16). The binding
+  cache's hit path prepared null views, which ran on null image slot 0: a 0-byte staging request or
+  `Touch(-1)`. It can crash any game and is in the 0.1.32 and 0.1.33 releases.
+- **The black screen.** `TLD4.PTP.F16` was rejected because its rewrite moves destinations to scratch
+  registers that the per-tap check refused. That was the upscaler's last compute pass, so the final
+  image held only the HUD.
+- **`CALL.REL.NOINC` is captured as a call** (`program_capture.h`), `SHF.R.U64` no longer clamps its
+  shift, and an occlusion query no longer starts on a deferred clear, which began it outside the render
+  pass.
+
+### Added
+- **Hand port of Lichii's OOT shader work** (PR #87 up to 4435506c96, plus 325e0a867b):
+  - The full register shadow list, and opcodes `0x4a4`, `0x243`, `0x499` and `0xc07`.
+  - F32 and signed reductions, signed REDUX, 64-bit shifts and negated F2I.
+  - UBREV, UFLO and UPOPC on every uniform register, guarded UISETP and USEL, and ISETP.EX with
+    accumulation.
+  - Array gathers, UIADD3 carry forms, and global atomic add and umax in SPIR-V.
+- **Lichii's pointer tracker in the global memory pass** (`global_memory_to_storage_buffer_pass.cpp`),
+  alongside our pruned search. Its `coherent` flag on loads is left out.
+- `KeplerCompute::SizesStorageBuffersFromMapping()`: OOT's native dispatches size storage buffers from
+  their mappings, as game DLSS passes do. `EDEN_NX2_OOT_MAPPED_SSBO=0` turns it off for OOT.
+- `EDEN_NX2_METHOD_RUN=0` turns `CallMethodRun` off, for bisecting.
+
+### Changed
+- **Shader cache version 22.** Caches written with the shader reuse bug have no storage pointer
+  classifications, so their pipelines failed at boot and stayed null for the session. Every game
+  rebuilds its shader cache once.
+- The DLSS chain only starts in Fortune's Weave, as in Lichii.
+
+### Internal
+- Tests: Lichii's exact-encoding tests and the exact words from OOT's rejections
+  (`ampere_lowering.cpp`).
+- Known: performance in OOT is uninvestigated (game speed dropped to 29% during shader builds, and one
+  compute pipeline took 18 s in the driver). Lichii's `fix/oot-boot` rejects the same upscaler pass and
+  still shows a picture, which is unexplained.
+
 ## [0.1.33] - 2026-11-04
 
 Brings in upstream `nx2` e736dfde9e (57 commits), mainly for OOT, which now gets past its startup

@@ -246,6 +246,9 @@ public:
     bool IsNativeMode() const { return native_mode; }
     /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
     bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
+    /// Whether the dispatch's storage buffers are sized from their mappings: game DLSS passes, and
+    /// every native dispatch of Ocarina of Time.
+    [[nodiscard]] bool SizesStorageBuffersFromMapping() const;
     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
     /// for Donkey Kong Bananza.

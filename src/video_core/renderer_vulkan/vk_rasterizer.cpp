@@ -1094,7 +1094,10 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     }
 
     query_cache.NotifySegment(true);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // Deferred load-op clears have no render pass yet. Starting a query here would begin it outside
+    // the pass and end it inside the next draw's pass.
+    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                              !can_defer_clear && maxwell3d->regs.zpass_pixel_count_enable);
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;

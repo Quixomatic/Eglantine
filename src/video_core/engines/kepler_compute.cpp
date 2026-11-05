@@ -550,7 +550,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     // Fortune's Weave's DLSS evaluation runs from its first pass to the pass that writes the
     // upscaled image. Its inputs are kept from the first pass for a replacement upscale.
-    if (RememberDlssMotionVectors()) {
+    constexpr u64 FortunesWeaveProgramId = 0x04007EF01F8AE000ULL;
+    if (Settings::GetCurrentProgramID() == FortunesWeaveProgramId && RememberDlssMotionVectors()) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
@@ -638,6 +639,16 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
         return GameDlssReason::Unsupported;
     }
     return GameDlssReason::None;
+}
+
+bool KeplerCompute::SizesStorageBuffersFromMapping() const {
+    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    static const bool ocarina_sizing = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_MAPPED_SSBO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return native_mode && (dlss_chain.active ||
+                           (ocarina_sizing && Settings::GetCurrentProgramID() == OcarinaOfTimeProgramId));
 }
 
 bool KeplerCompute::EmulatesNativeTensorPrograms() const {

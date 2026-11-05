@@ -542,7 +542,11 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
 }
 
 void Maxwell3D::CallMethodRun(Core::System& system, const u64* words, size_t count) {
-    if (record_write_history || g_trace_first_method_writes) [[unlikely]] {
+    static const bool method_run_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_METHOD_RUN");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!method_run_enabled || record_write_history || g_trace_first_method_writes) [[unlikely]] {
         EngineInterface::CallMethodRun(system, words, count);
         return;
     }

@@ -3738,11 +3738,13 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
 template <class P>
 void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modification,
                                        bool invalidate) {
-    if (!image_view_id) {
+    // The null view (an empty texture slot) has only the null image, which has no contents to
+    // refresh and no place in the LRU.
+    if (!image_view_id || image_view_id == NULL_IMAGE_VIEW_ID) {
         return;
     }
     const ImageViewBase& image_view = slot_image_views[image_view_id];
-    if (image_view.IsBuffer()) {
+    if (image_view.IsBuffer() || image_view.image_id == NULL_IMAGE_ID) {
         return;
     }
     PrepareImage(image_view.image_id, is_modification, invalidate);
